@@ -1,0 +1,4 @@
+# Core Dependencies
+pyyaml==6.0.1
+tcod==21.2.0
+PySide6==6.11.0

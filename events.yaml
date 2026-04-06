@@ -1,0 +1,135 @@
+shops:
+  repair_patch:
+    name: "Kernel Patch"
+    type: "heal"
+    cost: 45
+    amount: 12
+  scrap_bot:
+    name: "Scrap Bot Chassis"
+    type: "bot"
+    cost: 120
+    ram_reservation: 1
+    script_ram_cap: 2
+    cadence: 2
+  ram_upgrade:
+    name: "RAM Overclock"
+    type: "ram"
+    cost: 140
+    amount: 1
+  trace_scrubber:
+    name: "Trace Scrubber"
+    type: "trace"
+    cost: 90
+    amount: 20
+  ram_capsule_crate:
+    name: "RAM Capsule"
+    type: "consumable"
+    cost: 32
+    item_id: "ram_capsule"
+    quantity: 1
+  decoy_shroud_crate:
+    name: "Honeypot Seed"
+    type: "consumable"
+    cost: 42
+    item_id: "decoy_shroud"
+    quantity: 1
+  guard_spike_crate:
+    name: "ACL Spike"
+    type: "consumable"
+    cost: 38
+    item_id: "guard_spike"
+    quantity: 1
+  failsafe_patch_crate:
+    name: "Failsafe Patch"
+    type: "consumable"
+    cost: 52
+    item_id: "failsafe_patch"
+    quantity: 1
+  trap_kit_crate:
+    name: "Canary Kit"
+    type: "consumable"
+    cost: 36
+    item_id: "trap_kit"
+    quantity: 1
+
+consumables:
+  ram_capsule:
+    name: "RAM Capsule"
+    description: "One-use injector. Instantly restores 4 RAM."
+    effect: "ram"
+    amount: 4
+  decoy_shroud:
+    name: "Honeypot Seed"
+    description: "One-use counterintel veil. Drops hostile recon by one stage and seeds a honeypot."
+    effect: "decoy"
+    scrub_stages: 1
+    jammer_turns: 1
+  guard_spike:
+    name: "ACL Spike"
+    description: "One-use hardening patch. Wraps one subsystem in a 7-point ACL shell for 2 turns."
+    effect: "guard"
+    amount: 7
+    turns: 2
+    requires_target: true
+  failsafe_patch:
+    name: "Failsafe Patch"
+    description: "One-use emergency restore. Repairs 10 Core OS and clears RAM lock residue."
+    effect: "patch"
+    amount: 10
+  trap_kit:
+    name: "Canary Kit"
+    description: "One-use predictive snare. Arms a 6-damage canary callback on one subsystem for 2 turns."
+    effect: "tripwire"
+    trap_damage: 6
+    turns: 2
+    requires_target: true
+
+nodes:
+  civilian:
+    reward_min: 18
+    reward_max: 36
+    repair_min: 2
+    repair_max: 5
+    difficulty_bonus: 4
+  personal:
+    reward_min: 20
+    reward_max: 34
+    repair_min: 1
+    repair_max: 4
+    difficulty_bonus: 4
+  minecraft:
+    reward_min: 34
+    reward_max: 62
+    repair_min: 0
+    repair_max: 2
+    difficulty_bonus: 5
+  iot:
+    reward_min: 22
+    reward_max: 42
+    repair_min: 0
+    repair_max: 2
+    difficulty_bonus: 4
+  server:
+    reward_min: 40
+    reward_max: 76
+    repair_min: 0
+    repair_max: 3
+    difficulty_bonus: 6
+  corporate:
+    reward_min: 45
+    reward_max: 80
+    repair_min: 0
+    repair_max: 3
+    difficulty_bonus: 6
+  honeypot:
+    reward_min: 30
+    reward_max: 55
+    repair_min: 0
+    repair_max: 2
+    difficulty_bonus: 5
+  gatekeeper:
+    reward_min: 90
+    reward_max: 140
+    repair_min: 4
+    repair_max: 8
+    difficulty_bonus: 8

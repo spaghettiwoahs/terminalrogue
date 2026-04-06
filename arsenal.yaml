@@ -1,0 +1,166 @@
+# data/arsenal.yaml
+
+scripts:
+  ping:
+    ram: 1
+    damage: 2
+    type: "brute_force"
+    description: "ICMP echo probe. Your cheapest starter payload: it confirms the host is answering, deals light lane pressure, and leaves a short timing window for a follow-up on the same subsystem."
+    allowed_flags: ["--ransom", "--stealth", "--worm", "--burst"]
+  nmap:
+    ram: 2
+    damage: 0
+    type: "scan"
+    description: "TCP/service scan. Reveals open ports, banners, and the host's subsystem map. Targeted mode performs deeper fingerprinting on one lane and primes later exploit work there."
+    allowed_flags: ["--stealth", "--ghost"]
+  enum:
+    ram: 3
+    damage: 0
+    type: "scan"
+    description: "Host and service enumeration. Resolves exact telemetry on one subsystem and sharpens your read on the host's next move."
+    allowed_flags: ["--stealth", "--ghost"]
+  whois:
+    ram: 1
+    damage: 0
+    type: "scan"
+    description: "Ownership lookup. Pulls registrant and operator clues while lowering the exposure cost of the next recon action."
+    allowed_flags: ["--stealth", "--ghost"]
+    supports_target: false
+  dirb:
+    ram: 2
+    damage: 0
+    type: "scan"
+    description: "Directory and endpoint brute force. Hunts exposed paths on one subsystem, resolves exact telemetry, and primes later injection work."
+    allowed_flags: ["--stealth", "--ghost"]
+  airmon-ng:
+    ram: 3
+    damage: 2
+    type: "exploit"
+    description: "Monitor-mode pivot. Peels back perimeter controls on [SEC] long enough for deeper fingerprinting and cleaner follow-up pressure."
+    allowed_flags: ["--stealth"]
+    default_target: "SEC"
+    disrupt_turns: 2
+  hydra:
+    ram: 4
+    damage: 8
+    type: "brute_force"
+    description: "Credential brute force. Lands as several rapid login attempts and is strongest on auth-heavy lanes, especially after spray pressure."
+    allowed_flags: ["--ransom", "--stealth", "--worm", "--burst", "--volatile"]
+  sqlmap:
+    ram: 3
+    damage: 5
+    type: "exploit"
+    description: "Injection framework. Excels against database-backed or web-facing lanes and gets stronger once dirb has already found a path."
+    allowed_flags: ["--ransom", "--stealth", "--worm", "--fork", "--burst", "--volatile"]
+  spray:
+    ram: 3
+    damage: 4
+    type: "exploit"
+    description: "Password spray. Broad auth pressure that destabilizes login surfaces and primes them for a stronger hydra follow-up."
+    allowed_flags: ["--ransom", "--stealth", "--fork", "--burst", "--volatile"]
+  shred:
+    ram: 3
+    damage: 5
+    type: "brute_force"
+    description: "Destructive wipe routine. Most effective once a subsystem is already unstable and can briefly deny recovery on damaged memory or storage lanes."
+    allowed_flags: ["--ransom", "--stealth", "--burst", "--volatile"]
+  overflow:
+    ram: 4
+    damage: 6
+    type: "exploit"
+    description: "Memory corruption payload. Performs best on [MEM] and [NET] lanes with exposed services and can jam the host's next action."
+    allowed_flags: ["--ransom", "--stealth", "--fork", "--burst", "--volatile"]
+  hammer:
+    ram: 5
+    damage: 10
+    type: "brute_force"
+    description: "Custom crash harness. Loud, expensive, and best used after the perimeter is already open. Clean core hits can force a panic spill and stall the host's next move."
+    allowed_flags: ["--ransom", "--worm", "--burst", "--volatile"]
+  spoof:
+    ram: 2
+    damage: 0
+    type: "utility"
+    description: "Counter-recon traffic shaping. Corrupts hostile recon already locked on to you and muddies the host's recent behavioral cache."
+    allowed_flags: []
+    supports_target: false
+  harden:
+    ram: 2
+    damage: 0
+    type: "utility"
+    description: "ACL hardening. Temporarily reinforces one subsystem and pays extra if you correctly predict the incoming lane of attack."
+    aliases: ["fortify"]
+    allowed_flags: []
+    guard: 5
+    turns: 1
+  honeypot:
+    ram: 2
+    damage: 0
+    type: "utility"
+    description: "Decoy surface. The next hostile scan resolves against planted telemetry instead of your real node."
+    aliases: ["jammer"]
+    allowed_flags: []
+    supports_target: false
+  canary:
+    ram: 3
+    damage: 0
+    type: "utility"
+    description: "Watchpoint trap. Arm it on one subsystem and it fires back if the host commits to that lane."
+    aliases: ["tripwire"]
+    allowed_flags: []
+    trap_damage: 5
+    turns: 1
+  sinkhole:
+    ram: 3
+    damage: 0
+    type: "utility"
+    description: "Traffic sinkhole. Redirects the next hostile action on one subsystem back into its source."
+    aliases: ["mirror"]
+    allowed_flags: []
+    turns: 1
+    ratio: 1.0
+    flat_damage: 2
+  rekey:
+    ram: 2
+    damage: 0
+    type: "utility"
+    description: "Session-key rotation. Clears RAM-lock residue, peels back hostile recon, and invalidates the host's cached read on your recent behavior."
+    aliases: ["purge"]
+    allowed_flags: []
+    supports_target: false
+  patch:
+    ram: 2
+    damage: 0
+    repair: 6
+    type: "utility"
+    description: "Emergency patch cycle. Restores Core OS integrity, lightly restitches the most damaged supporting lane, and can warm a little RAM back into circulation."
+    allowed_flags: []
+    supports_target: false
+
+flags:
+  --ransom:
+    ram: 1
+    description: "Extortion wrapper. Turns a clean breach into leverage and squeezes value out of every packet that actually lands."
+  --stealth:
+    ram: 2
+    description: "Low-signature wrapper. Smears the traffic pattern and tucks the payload under a quieter route profile."
+    exposure_delta: -15
+  --ghost:
+    ram: 1
+    description: "Light OPSEC sheath. A thinner veil than --stealth, built for quick recon passes that still want a little cover."
+    exposure_delta: -10
+  --worm:
+    ram: 2
+    description: "Self-propagating wrapper. Leaves a live stub in the wreckage and lets the payload crawl into whatever is still exposed."
+  --burst:
+    ram: 1
+    description: "Burst-fire wrapper. Tightens the strike window and slams the lane all at once, loud enough for everyone on the route to notice."
+    damage_bonus: 3
+    noise_bonus: 20
+  --fork:
+    ram: 2
+    description: "Multi-thread wrapper. Clones the payload thread and lets a second live lane catch the spill."
+  --volatile:
+    ram: 1
+    description: "Unsafe overclock wrapper. Pushes the payload past safe margins and lets the instability hit the target before it hits you."
+    damage_bonus: 2
+    noise_bonus: 12

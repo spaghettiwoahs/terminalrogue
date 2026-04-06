@@ -1,0 +1,432 @@
+# data/enemies.yaml
+
+modifiers:
+  hardened:
+    prefix: "Hardened "
+    base_os_bonus: 5
+    budget_bonus: 10
+    enemy_damage_multiplier: 1.15
+    bonus_abilities: ["patch_cycle"]
+  legacy:
+    prefix: "Legacy "
+    base_os_bonus: -5
+    budget_bonus: -5
+    enemy_damage_multiplier: 0.8
+    bonus_abilities: ["ping_flood"]
+  air_gapped:
+    prefix: "Air-Gapped "
+    base_os_bonus: 15
+    budget_bonus: 20
+    player_ram_modifier: -2
+    bonus_abilities: ["ram_lock"]
+  corrupted:
+    prefix: "Corrupted "
+    base_os_bonus: -5
+    budget_bonus: 5
+    enemy_damage_multiplier: 1.2
+    bonus_abilities: ["data_reaper"]
+  backdoored:
+    prefix: "Backdoored "
+    base_os_bonus: -10
+    budget_bonus: -10
+    player_crypto_bonus: 50
+    bonus_abilities: ["memory_spike"]
+  monitored:
+    prefix: "Monitored "
+    base_os_bonus: 10
+    budget_bonus: 15
+    trace_penalty: 25
+    bonus_abilities: ["trace_route"]
+
+abilities:
+  port_sweep:
+    kind: "scan_topology"
+    name: "SYN Sweep"
+    weight: 4
+  exploit_fingerprint:
+    kind: "scan_signature"
+    name: "Version Fingerprint"
+    weight: 3
+  ping_flood:
+    kind: "attack"
+    name: "ICMP Saturation"
+    damage: 4
+    target: "OS"
+    weight: 3
+  memory_spike:
+    kind: "attack"
+    name: "Heap Spray"
+    damage: 4
+    target: "MEM"
+    weight: 2
+  firewall_shunt:
+    kind: "attack"
+    name: "ACL Rebind"
+    damage: 3
+    target: "SEC"
+    weight: 2
+  proxy_splitter:
+    kind: "attack"
+    name: "Route Table Poison"
+    damage: 3
+    target: "NET"
+    weight: 2
+  packet_storm:
+    kind: "attack"
+    name: "Queue Flood"
+    damage: 4
+    target: "NET"
+    weight: 2
+  dns_maze:
+    kind: "attack"
+    name: "Resolver Poison"
+    damage: 4
+    target: "NET"
+    weight: 2
+  chunk_overflow:
+    kind: "attack"
+    name: "Heap Overflow"
+    damage: 5
+    target: "MEM"
+    weight: 2
+  heap_shred:
+    kind: "attack"
+    name: "Allocator Corruption"
+    damage: 5
+    target: "MEM"
+    weight: 2
+  lens_burn:
+    kind: "attack"
+    name: "Credential Replay Burn"
+    damage: 4
+    target: "SEC"
+    weight: 2
+  tls_needle:
+    kind: "attack"
+    name: "TLS Renegotiation Spike"
+    damage: 4
+    target: "SEC"
+    weight: 2
+  kernel_jab:
+    kind: "attack"
+    name: "Kernel Panic Probe"
+    damage: 5
+    target: "OS"
+    weight: 2
+  cronlash:
+    kind: "attack"
+    name: "Cron Desync"
+    damage: 4
+    target: "OS"
+    weight: 2
+  trace_route:
+    kind: "trace"
+    name: "Trace Escalation"
+    trace: 12
+    weight: 2
+  patch_cycle:
+    kind: "repair"
+    name: "Service Restart"
+    target: "SEC"
+    amount: 4
+    weight: 2
+  cache_patch:
+    kind: "repair"
+    name: "Snapshot Restore"
+    target: "STO"
+    amount: 4
+    weight: 1
+  ram_lock:
+    kind: "ram_lock"
+    name: "Resource Starvation"
+    amount: 2
+    turns: 2
+    target: "MEM"
+    weight: 2
+  data_reaper:
+    kind: "drain"
+    name: "Archive Exfiltration"
+    damage: 3
+    target: "STO"
+    crypto: 15
+    weight: 1
+  miner_leech:
+    kind: "drain"
+    name: "Wallet Skim"
+    damage: 2
+    target: "STO"
+    crypto: 22
+    weight: 2
+  sector_chew:
+    kind: "drain"
+    name: "Block Corruption"
+    damage: 3
+    target: "STO"
+    crypto: 14
+    weight: 2
+  defense_breach:
+    kind: "strip_defense"
+    name: "EDR Unhook"
+    weight: 2
+  burn_notice:
+    kind: "finisher"
+    name: "Session Burn"
+    damage: 999
+    target: "OS"
+
+enemies:
+  training_drone:
+    name: "Sandbox Drone"
+    description: "A disposable lab host with a paper-thin perimeter and a predictable service map."
+    weapon: "Debug service"
+    base_os: 8
+    budget: 0
+    weakness: "SEC"
+    abilities: ["port_sweep", "ping_flood"]
+    loot_table: "none"
+    disconnect_lock: false
+
+  grandma_pc:
+    name: "Grandma's Desktop"
+    description: "A neglected home desktop with outdated remote-access software and weak passwords."
+    weapon: "Legacy ICMP flood"
+    base_os: 15
+    budget: 10
+    weakness: "random"
+    abilities: ["port_sweep", "ping_flood", "memory_spike"]
+    loot_table: "low_tier"
+    disconnect_lock: false
+
+  sleepy_laptop:
+    name: "Sleepy Laptop"
+    description: "A consumer laptop with poor patch hygiene, stale sessions, and too many saved credentials."
+    weapon: "Notification flood"
+    base_os: 13
+    budget: 8
+    weakness: "random"
+    abilities: ["port_sweep", "ping_flood", "proxy_splitter"]
+    loot_table: "low_tier"
+    disconnect_lock: false
+
+  streamer_rig:
+    name: "Streamer Rig"
+    description: "An overclocked desktop running live overlays, chat plugins, and a memory bus near failure."
+    weapon: "Encoder fault"
+    base_os: 14
+    budget: 9
+    weakness: "MEM"
+    abilities: ["port_sweep", "ping_flood", "packet_storm", "heap_shred"]
+    loot_table: "low_tier"
+    disconnect_lock: false
+
+  family_nas:
+    name: "Family NAS Array"
+    description: "A home backup appliance full of snapshots, stale shares, and poorly rotated credentials."
+    weapon: "RAID panic loop"
+    base_os: 16
+    budget: 9
+    weakness: "STO"
+    abilities: ["port_sweep", "exploit_fingerprint", "sector_chew", "patch_cycle"]
+    loot_table: "mid_tier"
+    disconnect_lock: false
+
+  minecraft_server:
+    name: "Unpatched Minecraft Server"
+    description: "A hobby game server with stale plugins, exposed panels, and a neglected donation database."
+    weapon: "Plugin crash loop"
+    base_os: 10
+    budget: 3
+    weakness: "STO"
+    abilities: ["port_sweep", "chunk_overflow", "miner_leech"]
+    loot_table: "crypto_cache"
+    disconnect_lock: false
+
+  watcher_ipcam:
+    name: "Watcher IPCam Cluster"
+    description: "Commodity cameras daisy-chained behind a brittle web console and exposed control plane."
+    weapon: "PTZ control spike"
+    base_os: 12
+    budget: 9
+    weakness: "NET"
+    abilities: ["port_sweep", "proxy_splitter", "lens_burn", "trace_route"]
+    loot_table: "sensor_scrap"
+    disconnect_lock: false
+
+  smart_tv_wall:
+    name: "Smart TV Wall"
+    description: "A wall of consumer TVs chained to a sloppy ad-telemetry backend and shared admin surface."
+    weapon: "Ad telemetry flood"
+    base_os: 12
+    budget: 8
+    weakness: "NET"
+    abilities: ["port_sweep", "dns_maze", "trace_route", "proxy_splitter"]
+    loot_table: "sensor_scrap"
+    disconnect_lock: false
+
+  weather_station:
+    name: "Weather Station Rack"
+    description: "Field sensors with bad certificates, thin perimeter controls, and years of cached telemetry."
+    weapon: "Telemetry spike"
+    base_os: 11
+    budget: 7
+    weakness: "STO"
+    abilities: ["port_sweep", "sector_chew", "trace_route", "cache_patch"]
+    loot_table: "sensor_scrap"
+    disconnect_lock: false
+
+  router_hub:
+    name: "Neighborhood Router Hub"
+    description: "An aging routing edge held together by default credentials, old ACLs, and cached state."
+    weapon: "Route flap"
+    base_os: 14
+    budget: 9
+    weakness: "SEC"
+    abilities: ["port_sweep", "exploit_fingerprint", "firewall_shunt", "dns_maze", "proxy_splitter"]
+    loot_table: "mid_tier"
+    disconnect_lock: false
+
+  smart_fridge_mesh:
+    name: "Smart Fridge Mesh"
+    description: "A consumer IoT mesh that should never have been routable past the local subnet."
+    weapon: "MQTT panic loop"
+    base_os: 11
+    budget: 8
+    weakness: "NET"
+    abilities: ["port_sweep", "proxy_splitter", "trace_route", "defense_breach"]
+    loot_table: "sensor_scrap"
+    disconnect_lock: false
+
+  office_printer:
+    name: "Office Printer Daemon"
+    description: "A printer daemon with ancient firmware, cached admin credentials, and a stubborn spooler."
+    weapon: "Spooler fault"
+    base_os: 13
+    budget: 8
+    weakness: "SEC"
+    abilities: ["port_sweep", "exploit_fingerprint", "firewall_shunt", "defense_breach"]
+    loot_table: "low_tier"
+    disconnect_lock: false
+
+  budget_rack:
+    name: "Budget Rack Server"
+    description: "A low-cost hosted server built from stale cron jobs, loose permissions, and panic patches."
+    weapon: "Cron desync"
+    base_os: 18
+    budget: 12
+    weakness: "random"
+    abilities: ["port_sweep", "exploit_fingerprint", "cronlash", "memory_spike", "patch_cycle"]
+    loot_table: "mid_tier"
+    disconnect_lock: false
+
+  backup_tape_library:
+    name: "Backup Tape Library"
+    description: "An archive system full of old snapshots, stale keys, and brittle restore daemons."
+    weapon: "Restore thrash"
+    base_os: 17
+    budget: 11
+    weakness: "STO"
+    abilities: ["port_sweep", "exploit_fingerprint", "sector_chew", "cache_patch", "trace_route"]
+    loot_table: "mid_tier"
+    disconnect_lock: false
+
+  warehouse_plc:
+    name: "Warehouse PLC Stack"
+    description: "Industrial control gear that should have been segmented years ago but still exposes management paths."
+    weapon: "Controller latch fault"
+    base_os: 18
+    budget: 12
+    weakness: "SEC"
+    abilities: ["port_sweep", "tls_needle", "proxy_splitter", "patch_cycle", "defense_breach"]
+    loot_table: "mid_tier"
+    disconnect_lock: false
+
+  mail_spool:
+    name: "Mail Spool Relay"
+    description: "A mail relay with weak queue logic, exposed auth, and too many stored contacts."
+    weapon: "Queue storm"
+    base_os: 17
+    budget: 12
+    weakness: "STO"
+    abilities: ["port_sweep", "exploit_fingerprint", "sector_chew", "packet_storm", "patch_cycle"]
+    loot_table: "mid_tier"
+    disconnect_lock: false
+
+  research_cluster:
+    name: "Research Compute Cluster"
+    description: "A compute cluster with wide memory lanes, exposed schedulers, and administrators who patch under pressure."
+    weapon: "Scheduler starvation"
+    base_os: 20
+    budget: 14
+    weakness: "MEM"
+    abilities: ["port_sweep", "exploit_fingerprint", "heap_shred", "ram_lock", "defense_breach", "patch_cycle"]
+    loot_table: "high_tier"
+    disconnect_lock: false
+
+  campus_vpn:
+    name: "Campus VPN Concentrator"
+    description: "A university access concentrator carrying too many tunnels and too little patch discipline."
+    weapon: "Tunnel reset"
+    base_os: 19
+    budget: 13
+    weakness: "NET"
+    abilities: ["port_sweep", "exploit_fingerprint", "dns_maze", "ram_lock", "trace_route"]
+    loot_table: "high_tier"
+    disconnect_lock: false
+
+  omnicorp_gateway:
+    name: "OmniCorp Gateway"
+    description: "A hardened enterprise edge relay with adaptive counter-intrusion logic and disciplined operators."
+    weapon: "Adaptive response suite"
+    base_os: 22
+    budget: 15
+    weakness: "random"
+    abilities: ["port_sweep", "exploit_fingerprint", "ping_flood", "memory_spike", "trace_route", "patch_cycle", "defense_breach", "kernel_jab"]
+    loot_table: "high_tier"
+    guaranteed_flag_drop: "--worm"
+    disconnect_lock: false
+
+  sentinel_fabric:
+    name: "Sentinel Fabric"
+    description: "A regional policy mesh built to throttle routes, cache signatures, and punish predictable traffic."
+    weapon: "Policy engine"
+    base_os: 24
+    budget: 16
+    weakness: "random"
+    abilities: ["port_sweep", "exploit_fingerprint", "kernel_jab", "heap_shred", "trace_route", "defense_breach", "patch_cycle"]
+    loot_table: "high_tier"
+    disconnect_lock: false
+
+  civic_backbone:
+    name: "Civic Backbone"
+    description: "A municipal routing spine full of audit trails, policy engines, and aggressive counter-intrusion hooks."
+    weapon: "Audit enforcement"
+    base_os: 25
+    budget: 17
+    weakness: "random"
+    abilities: ["port_sweep", "exploit_fingerprint", "dns_maze", "tls_needle", "ram_lock", "trace_route", "patch_cycle", "defense_breach"]
+    loot_table: "high_tier"
+    disconnect_lock: false
+
+  aegis_black_ice:
+    name: "Aegis Black ICE"
+    description: "A sovereign-grade counter-intrusion daemon built to trace, profile, and burn hostile sessions in place."
+    weapon: "Counter-intrusion kill chain"
+    base_os: 48
+    budget: 24
+    weakness: "NET"
+    abilities:
+      [
+        "port_sweep",
+        "exploit_fingerprint",
+        "firewall_shunt",
+        "memory_spike",
+        "proxy_splitter",
+        "ram_lock",
+        "trace_route",
+        "patch_cycle",
+        "data_reaper",
+        "burn_notice",
+      ]
+    forced_finisher_turn: 4
+    loot_table: "none"
+    disconnect_lock: true

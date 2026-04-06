@@ -1,0 +1,15 @@
+.idea/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+build/
+dist/
+release/
+
+save_data.pkl
+*.spec.tmp
+
+Terminal Rogue/
