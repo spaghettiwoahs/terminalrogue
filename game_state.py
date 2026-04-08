@@ -1,5 +1,7 @@
 import pickle
 import random
+from datetime import datetime
+from pathlib import Path
 
 from contracts import evaluate_contract, generate_contracts
 from exploit_system import generate_run_exploit_catalog
@@ -31,13 +33,28 @@ class ThreatLedger:
 
 
 class GameState:
+    SAVE_DIRNAME = "saves"
+    LEGACY_SAVE_FILENAME = "save_data.pkl"
+    AUTOSAVE_SLOT_KEY = "autosave"
+    MANUAL_SLOT_KEYS = ("slot_1", "slot_2", "slot_3")
+    SAVE_KEY_FILENAMES = {
+        AUTOSAVE_SLOT_KEY: "autosave.pkl",
+        "slot_1": "slot_1.pkl",
+        "slot_2": "slot_2.pkl",
+        "slot_3": "slot_3.pkl",
+    }
+
     def __init__(self):
+        self.save_version = 2
         self.threat_ledger = ThreatLedger()
         self.player_crypto = 0
         self.trace_level = 0
         self.day = 1
+        self.cleared_subnets_total = 0
+        self.completed_contracts_total = 0
         self.game_over = False
         self.prologue_complete = False
+        self.lore_intro_complete = False
         self.origin_story = "rookie"
         self.run_seed = random.randint(10_000, 999_999)
         self.exploit_catalog = generate_run_exploit_catalog(self.run_seed)
@@ -47,15 +64,151 @@ class GameState:
         self.encounter_script_log = []
         self.encounter_triggered_exploits = []
         self.current_contracts = []
+        self.active_contracts = []
         self.contract_history = []
+        self.meta_unlocks = set()
+        self.module_inventory = {}
+        self.rooted_domains = {}
+        self.active_network = None
+        self.current_subnet_id = None
+        self.current_domain_id = None
+        self.subnet_contract_inboxes = {}
+        self.bound_contract_subnet_id = None
 
-    @staticmethod
-    def resolve_save_path(filename="save_data.pkl"):
+    @classmethod
+    def save_filename_for_key(cls, slot_key: str) -> str:
+        if slot_key not in cls.SAVE_KEY_FILENAMES:
+            raise ValueError(f"Unknown save slot: {slot_key}")
+        return str(Path(cls.SAVE_DIRNAME) / cls.SAVE_KEY_FILENAMES[slot_key])
+
+    @classmethod
+    def legacy_save_path(cls):
+        return resolve_user_data_path(cls.LEGACY_SAVE_FILENAME)
+
+    @classmethod
+    def migrate_legacy_autosave(cls):
+        legacy_path = cls.legacy_save_path()
+        autosave_path = resolve_user_data_path(cls.save_filename_for_key(cls.AUTOSAVE_SLOT_KEY))
+        autosave_path.parent.mkdir(parents=True, exist_ok=True)
+        if legacy_path.exists() and not autosave_path.exists():
+            legacy_path.replace(autosave_path)
+
+    @classmethod
+    def resolve_save_path(cls, filename=None, slot_key=None):
+        if slot_key is not None:
+            filename = cls.save_filename_for_key(slot_key)
+        elif not filename or filename == cls.LEGACY_SAVE_FILENAME:
+            filename = cls.save_filename_for_key(cls.AUTOSAVE_SLOT_KEY)
         return str(resolve_user_data_path(filename))
 
+    @classmethod
+    def default_slot_label(cls, slot_key: str) -> str:
+        if slot_key == cls.AUTOSAVE_SLOT_KEY:
+            return "autosave"
+        slot_number = cls.MANUAL_SLOT_KEYS.index(slot_key) + 1
+        return f"slot {slot_number}"
+
+    @classmethod
+    def iter_save_slot_keys(cls):
+        return [cls.AUTOSAVE_SLOT_KEY, *cls.MANUAL_SLOT_KEYS]
+
+    @staticmethod
+    def build_save_metadata(state, player, *, slot_key: str, display_name: str | None, kind: str):
+        handle = getattr(player, "handle", "operator")
+        title = getattr(player, "title", "burner")
+        profile = getattr(player, "profile", "rookie")
+        return {
+            "slot_key": slot_key,
+            "kind": kind,
+            "display_name": (display_name or "").strip() or GameState.default_slot_label(slot_key),
+            "saved_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "day": getattr(state, "day", 1),
+            "wallet": getattr(state, "player_crypto", 0),
+            "trace": getattr(state, "trace_level", 0),
+            "origin": getattr(state, "origin_story", "rookie"),
+            "handle": handle,
+            "title": title,
+            "profile": profile,
+            "seed": getattr(state, "run_seed", None),
+        }
+
+    @classmethod
+    def inspect_save_slot(cls, slot_key: str):
+        cls.migrate_legacy_autosave()
+        save_path = resolve_user_data_path(cls.save_filename_for_key(slot_key))
+        if not save_path.exists() and slot_key == cls.AUTOSAVE_SLOT_KEY:
+            legacy_path = cls.legacy_save_path()
+            if legacy_path.exists():
+                save_path = legacy_path
+        if not save_path.exists():
+            return {
+                "slot_key": slot_key,
+                "kind": "autosave" if slot_key == cls.AUTOSAVE_SLOT_KEY else "manual",
+                "display_name": cls.default_slot_label(slot_key),
+                "exists": False,
+                "saved_at": "",
+                "day": None,
+                "wallet": None,
+                "trace": None,
+                "handle": "",
+                "title": "",
+                "profile": "",
+            }
+        try:
+            with open(save_path, "rb") as f:
+                payload = pickle.load(f)
+        except Exception:
+            return {
+                "slot_key": slot_key,
+                "kind": "autosave" if slot_key == cls.AUTOSAVE_SLOT_KEY else "manual",
+                "display_name": cls.default_slot_label(slot_key),
+                "exists": False,
+                "saved_at": "",
+                "day": None,
+                "wallet": None,
+                "trace": None,
+                "handle": "",
+                "title": "",
+                "profile": "",
+            }
+
+        state = payload.get("state")
+        player = payload.get("player")
+        if state is not None:
+            state.ensure_runtime_defaults()
+        if player is not None and hasattr(player, "ensure_runtime_defaults"):
+            player.ensure_runtime_defaults()
+
+        meta = dict(payload.get("meta") or {})
+        if not meta:
+            meta = cls.build_save_metadata(
+                state,
+                player,
+                slot_key=slot_key,
+                display_name=None,
+                kind="autosave" if slot_key == cls.AUTOSAVE_SLOT_KEY else "manual",
+            )
+        meta["slot_key"] = slot_key
+        meta["kind"] = meta.get("kind") or ("autosave" if slot_key == cls.AUTOSAVE_SLOT_KEY else "manual")
+        meta["display_name"] = meta.get("display_name") or cls.default_slot_label(slot_key)
+        meta["exists"] = True
+        return meta
+
+    @classmethod
+    def list_save_slots(cls):
+        return [cls.inspect_save_slot(slot_key) for slot_key in cls.iter_save_slot_keys()]
+
     def ensure_runtime_defaults(self):
+        if not hasattr(self, "save_version"):
+            self.save_version = 2
         if not hasattr(self, "prologue_complete"):
             self.prologue_complete = True
+        if not hasattr(self, "cleared_subnets_total"):
+            self.cleared_subnets_total = 0
+        if not hasattr(self, "completed_contracts_total"):
+            self.completed_contracts_total = 0
+        if not hasattr(self, "lore_intro_complete"):
+            self.lore_intro_complete = False
         if not hasattr(self, "origin_story"):
             self.origin_story = "rookie"
         if not hasattr(self, "run_seed"):
@@ -78,8 +231,30 @@ class GameState:
             self.encounter_triggered_exploits = []
         if not hasattr(self, "current_contracts"):
             self.current_contracts = []
+        if not hasattr(self, "active_contracts"):
+            self.active_contracts = []
         if not hasattr(self, "contract_history"):
             self.contract_history = []
+        if not hasattr(self, "meta_unlocks"):
+            self.meta_unlocks = set()
+        else:
+            self.meta_unlocks = set(self.meta_unlocks)
+        if not hasattr(self, "module_inventory"):
+            self.module_inventory = {}
+        if not hasattr(self, "rooted_domains"):
+            self.rooted_domains = {}
+        if not hasattr(self, "active_network"):
+            self.active_network = None
+        if not hasattr(self, "current_subnet_id"):
+            self.current_subnet_id = None
+        if not hasattr(self, "current_domain_id"):
+            self.current_domain_id = None
+        if not hasattr(self, "subnet_contract_inboxes"):
+            self.subnet_contract_inboxes = {}
+        if not hasattr(self, "bound_contract_subnet_id"):
+            self.bound_contract_subnet_id = None
+        if getattr(self, "active_network", None) and hasattr(self.active_network, "ensure_runtime_defaults"):
+            self.active_network.ensure_runtime_defaults()
 
     def reset_run_signatures(self):
         self.run_seed = random.randint(10_000, 999_999)
@@ -89,20 +264,78 @@ class GameState:
         ]
         self.begin_encounter_tracking()
         self.current_contracts = []
+        self.active_contracts = []
         self.contract_history = []
+        self.lore_intro_complete = False
+        self.module_inventory = {}
+        self.rooted_domains = {}
+        self.active_network = None
+        self.current_subnet_id = None
+        self.current_domain_id = None
+        self.subnet_contract_inboxes = {}
+        self.bound_contract_subnet_id = None
+        self.cleared_subnets_total = 0
+        self.completed_contracts_total = 0
+
+    def unlock_meta(self, unlock_id: str):
+        if unlock_id:
+            self.meta_unlocks.add(unlock_id)
+
+    def has_meta(self, unlock_id: str):
+        return unlock_id in self.meta_unlocks
 
     def begin_encounter_tracking(self):
         self.encounter_script_log = []
         self.encounter_triggered_exploits = []
 
-    def issue_world_contracts(self, world):
-        if self.current_contracts:
+    def issue_world_contracts(self, world, subnet_key=None):
+        messages = []
+        archived = []
+        for inbox in self.subnet_contract_inboxes.values():
+            archived.extend(dict(contract) for contract in inbox)
+        if not archived and self.current_contracts:
             archived = [dict(contract) for contract in self.current_contracts]
+        if archived:
             self.contract_history.extend(archived)
-        self.current_contracts = generate_contracts(self.run_seed, self.day, world)
+        if self.active_contracts:
+            expired = []
+            for contract in self.active_contracts:
+                archived_contract = dict(contract)
+                if not archived_contract.get("completed") and not archived_contract.get("failed"):
+                    archived_contract["failed"] = True
+                    archived_contract["failure_reason"] = "route mesh rotated before completion"
+                    messages.append(
+                        f"[CONTRACT EXPIRED] {archived_contract['subject']} // route mesh rotated."
+                    )
+                expired.append(archived_contract)
+            self.contract_history.extend(expired)
+        self.subnet_contract_inboxes = {}
+        self.bound_contract_subnet_id = None
+        self.current_contracts = []
+        if world is not None:
+            self.bind_contract_inbox(subnet_key or getattr(world, "subnet_id", getattr(world, "subnet_name", None)), world)
+        self.active_contracts = []
+        miner_yield = self.collect_domain_income()
+        if miner_yield > 0:
+            messages.append(f"[DOMAIN YIELD] Crypto miners transferred {miner_yield} Crypto.")
+        return messages
+
+    def bind_contract_inbox(self, subnet_key, world):
+        if world is None:
+            self.current_contracts = []
+            self.bound_contract_subnet_id = None
+            return
+        key = str(subnet_key or getattr(world, "subnet_id", getattr(world, "subnet_name", "current")))
+        if key not in self.subnet_contract_inboxes:
+            self.subnet_contract_inboxes[key] = generate_contracts(self, world, subnet_key=key)
+        self.bound_contract_subnet_id = key
+        self.current_contracts = self.subnet_contract_inboxes[key]
 
     def get_contract_by_id(self, contract_id: str):
         for contract in self.current_contracts:
+            if contract.get("id") == contract_id:
+                return contract
+        for contract in self.active_contracts:
             if contract.get("id") == contract_id:
                 return contract
         return None
@@ -111,28 +344,38 @@ class GameState:
         contract = self.get_contract_by_id(contract_id)
         if not contract or contract.get("completed") or contract.get("failed"):
             return False
+        if contract in self.active_contracts:
+            return True
         contract["accepted"] = True
+        self.active_contracts.append(contract)
+        self.current_contracts = [
+            entry for entry in self.current_contracts if entry.get("id") != contract_id
+        ]
+        if self.bound_contract_subnet_id is not None:
+            self.subnet_contract_inboxes[self.bound_contract_subnet_id] = self.current_contracts
         return True
 
     def get_accepted_contracts(self):
         return [
             contract
-            for contract in self.current_contracts
+            for contract in self.active_contracts
             if contract.get("accepted") and not contract.get("completed") and not contract.get("failed")
         ]
 
     def get_contracts_for_node(self, ip_address: str, *, accepted_only=False):
-        contracts = self.current_contracts
+        contracts = self.current_contracts + self.get_accepted_contracts()
         if accepted_only:
             contracts = self.get_accepted_contracts()
         return [contract for contract in contracts if contract.get("target_ip") == ip_address]
 
     def resolve_contracts_for_node(self, node, enemy, encounter_report):
         messages = []
+        resolved_ids = set()
         for contract in self.get_contracts_for_node(node.ip_address, accepted_only=True):
             passed, failure_reason = evaluate_contract(contract, node, enemy, encounter_report)
             if passed:
                 contract["completed"] = True
+                self.completed_contracts_total += 1
                 reward = contract.get("reward", 0)
                 self.player_crypto += reward
                 messages.append(
@@ -143,7 +386,178 @@ class GameState:
                 messages.append(
                     f"[CONTRACT FAILED] {contract['subject']} // {failure_reason}."
                 )
+            resolved_ids.add(contract["id"])
+
+        if resolved_ids:
+            archived_active = []
+            still_active = []
+            for contract in self.active_contracts:
+                if contract.get("id") in resolved_ids:
+                    archived_active.append(dict(contract))
+                else:
+                    still_active.append(contract)
+            self.active_contracts = still_active
+            self.contract_history.extend(archived_active)
         return messages
+
+    def mark_subnet_conquered(self, subnet_id: str):
+        if not subnet_id:
+            return
+        token = f"subnet:{subnet_id}"
+        if token in self.meta_unlocks:
+            return
+        self.meta_unlocks.add(token)
+        self.cleared_subnets_total += 1
+
+    def get_progression_score(self):
+        exploit_score = len(self.get_known_exploits()) * 2
+        rooted_score = len(self.rooted_domains) * 5
+        module_score = sum(self.module_inventory.values()) * 2
+        botnet_score = self.get_domain_botnet_power() * 3
+        subnet_score = self.cleared_subnets_total * 6
+        contract_score = self.completed_contracts_total * 4
+        economy_score = self.player_crypto // 90
+        return (
+            exploit_score
+            + rooted_score
+            + module_score
+            + botnet_score
+            + subnet_score
+            + contract_score
+            + economy_score
+        )
+
+    def get_progression_tier(self):
+        score = self.get_progression_score()
+        if score < 6:
+            return 0
+        if score < 14:
+            return 1
+        if score < 24:
+            return 2
+        if score < 36:
+            return 3
+        if score < 52:
+            return 4
+        return 5
+
+    def get_difficulty_pressure(self):
+        score = self.get_progression_score()
+        noise_pressure = (self.threat_ledger.brute_force_noise + self.threat_ledger.exploit_noise) // 120
+        trace_pressure = self.trace_level // 20
+        return max(1, 1 + (score // 6) + noise_pressure + trace_pressure)
+
+    def make_seed(self, *parts):
+        suffix = "::".join(str(part) for part in parts)
+        return f"{self.run_seed}::{suffix}"
+
+    def get_active_contract_summary_lines(self, limit=3):
+        active = self.get_accepted_contracts()
+        if not active:
+            return []
+        lines = ["ACTIVE CONTRACTS"]
+        for contract in active[:limit]:
+            lines.append(
+                f"- {contract['type']} @ {contract['target_ip']} // {contract['reward']}c"
+            )
+        if len(active) > limit:
+            lines.append(f"- +{len(active) - limit} more")
+        return lines
+
+    def grant_module_inventory(self, module_id: str, quantity: int = 1):
+        if not module_id or quantity <= 0:
+            return
+        self.module_inventory[module_id] = self.module_inventory.get(module_id, 0) + quantity
+
+    def consume_module_inventory(self, module_id: str, quantity: int = 1):
+        if self.module_inventory.get(module_id, 0) < quantity:
+            return False
+        remaining = self.module_inventory.get(module_id, 0) - quantity
+        if remaining > 0:
+            self.module_inventory[module_id] = remaining
+        else:
+            self.module_inventory.pop(module_id, None)
+        return True
+
+    def get_module_inventory_count(self, module_id: str):
+        return self.module_inventory.get(module_id, 0)
+
+    def claim_rooted_node(self, node):
+        domain_id = getattr(node, "domain_id", node.ip_address)
+        record = self.rooted_domains.get(domain_id, {})
+        record.update(
+            {
+                "domain_id": domain_id,
+                "ip_address": node.ip_address,
+                "node_type": node.node_type,
+                "day_claimed": self.day,
+                "module_slots": max(0, getattr(node, "module_slots", 0)),
+                "installed_module": getattr(node, "installed_module", None),
+                "root_access": getattr(node, "root_access", False),
+                "map_flags": list(getattr(node, "map_flags", [])),
+            }
+        )
+        self.rooted_domains[domain_id] = record
+        return record
+
+    def strip_rooted_node(self, node):
+        domain_id = getattr(node, "domain_id", node.ip_address)
+        return self.rooted_domains.pop(domain_id, None)
+
+    def install_module_on_node(self, node, module_id: str):
+        if not getattr(node, "root_access", False):
+            return False, "Root access is required before the node can host infrastructure."
+        if getattr(node, "module_slots", 0) <= 0:
+            return False, "This node has no free module slots."
+        if getattr(node, "installed_module", None):
+            return False, "This node already has an installed function."
+        if self.get_module_inventory_count(module_id) <= 0:
+            return False, f"No '{module_id}' package is available in your inventory."
+        if not self.consume_module_inventory(module_id, 1):
+            return False, f"Unable to reserve '{module_id}' from inventory."
+
+        node.installed_module = module_id
+        node.map_flags = list(dict.fromkeys([*getattr(node, "map_flags", []), module_id]))
+        self.claim_rooted_node(node)
+        return True, f"Installed '{module_id}' on {node.ip_address}."
+
+    def can_fast_travel_to(self, node):
+        return bool(getattr(node, "root_access", False) and getattr(node, "installed_module", None) == "vpn_tunnel")
+
+    def get_module_count(self, module_id: str):
+        return sum(
+            1
+            for domain in self.rooted_domains.values()
+            if domain.get("installed_module") == module_id
+        )
+
+    def get_domain_botnet_power(self):
+        return self.get_module_count("botnet_seed")
+
+    def collect_domain_income(self):
+        miner_count = self.get_module_count("crypto_miner")
+        if miner_count <= 0:
+            return 0
+        income = miner_count * 18
+        self.player_crypto += income
+        return income
+
+    def get_rooted_domain_summary_lines(self, limit=6):
+        if not self.rooted_domains:
+            return ["ROOTED DOMAINS", "- none"]
+        lines = ["ROOTED DOMAINS"]
+        domains = sorted(
+            self.rooted_domains.values(),
+            key=lambda domain: (domain.get("day_claimed", 0), domain.get("ip_address", "")),
+        )
+        for domain in domains[:limit]:
+            module = domain.get("installed_module") or "open"
+            lines.append(
+                f"- {domain.get('ip_address')} // {domain.get('node_type', 'node')} // {module}"
+            )
+        if len(domains) > limit:
+            lines.append(f"- +{len(domains) - limit} more")
+        return lines
 
     def get_known_exploits(self):
         known_ids = set(self.known_exploit_ids)
@@ -294,26 +708,60 @@ class GameState:
         }
 
     @staticmethod
-    def save_session(state, player, filename="save_data.pkl"):
+    def save_session(state, player, filename=None, *, slot_key=None, display_name=None):
         """Handles the serialization of the game session to keep data logic out of the UI."""
-        save_path = GameState.resolve_save_path(filename)
-        save_dir = resolve_user_data_path(filename).parent
+        resolved_slot_key = slot_key or GameState.AUTOSAVE_SLOT_KEY
+        save_path = GameState.resolve_save_path(filename, slot_key=resolved_slot_key)
+        save_dir = Path(save_path).parent
         save_dir.mkdir(parents=True, exist_ok=True)
+        state.ensure_runtime_defaults()
+        if hasattr(player, "ensure_runtime_defaults"):
+            player.ensure_runtime_defaults()
+        meta = GameState.build_save_metadata(
+            state,
+            player,
+            slot_key=resolved_slot_key,
+            display_name=display_name,
+            kind="autosave" if resolved_slot_key == GameState.AUTOSAVE_SLOT_KEY else "manual",
+        )
         with open(save_path, "wb") as f:
-            pickle.dump({"state": state, "player": player}, f)
+            pickle.dump({"state": state, "player": player, "meta": meta}, f)
 
     @staticmethod
-    def delete_session(filename="save_data.pkl"):
-        save_path = GameState.resolve_save_path(filename)
-        save_file = resolve_user_data_path(filename)
+    def delete_session(filename=None, *, slot_key=None):
+        GameState.migrate_legacy_autosave()
+        save_path = GameState.resolve_save_path(filename, slot_key=slot_key)
+        save_file = Path(save_path)
         if save_file.exists():
             save_file.unlink()
+        if slot_key in {None, GameState.AUTOSAVE_SLOT_KEY}:
+            legacy_path = GameState.legacy_save_path()
+            if legacy_path.exists():
+                legacy_path.unlink()
 
     @staticmethod
-    def load_session(filename="save_data.pkl"):
+    def load_session(filename=None, *, slot_key=None):
         """Loads a previously saved game session."""
-        save_path = GameState.resolve_save_path(filename)
-        if resolve_user_data_path(filename).exists():
+        GameState.migrate_legacy_autosave()
+        save_path = GameState.resolve_save_path(filename, slot_key=slot_key)
+        if Path(save_path).exists():
             with open(save_path, "rb") as f:
-                return pickle.load(f)
+                payload = pickle.load(f)
+            state = payload.get("state")
+            player = payload.get("player")
+            if state is not None:
+                state.ensure_runtime_defaults()
+            if player is not None and hasattr(player, "ensure_runtime_defaults"):
+                player.ensure_runtime_defaults()
+            meta = dict(payload.get("meta") or {})
+            if not meta:
+                resolved_slot_key = slot_key or GameState.AUTOSAVE_SLOT_KEY
+                meta = GameState.build_save_metadata(
+                    state,
+                    player,
+                    slot_key=resolved_slot_key,
+                    display_name=None,
+                    kind="autosave" if resolved_slot_key == GameState.AUTOSAVE_SLOT_KEY else "manual",
+                )
+            return {"state": state, "player": player, "meta": meta}
         return None

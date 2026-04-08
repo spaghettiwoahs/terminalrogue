@@ -51,11 +51,29 @@ shops:
     cost: 36
     item_id: "trap_kit"
     quantity: 1
+  vpn_tunnel_pkg:
+    name: "VPN Tunnel"
+    type: "module"
+    cost: 110
+    module_id: "vpn_tunnel"
+    quantity: 1
+  botnet_seed_pkg:
+    name: "Botnet Seed"
+    type: "module"
+    cost: 145
+    module_id: "botnet_seed"
+    quantity: 1
+  crypto_miner_pkg:
+    name: "Crypto Miner"
+    type: "module"
+    cost: 95
+    module_id: "crypto_miner"
+    quantity: 1
 
 consumables:
   ram_capsule:
     name: "RAM Capsule"
-    description: "One-use injector. Instantly restores 4 RAM."
+    description: "One-use injector. Adds 4 RAM immediately; any amount above your live cap becomes temporary overflow for the next payload."
     effect: "ram"
     amount: 4
   decoy_shroud:
@@ -83,6 +101,42 @@ consumables:
     trap_damage: 6
     turns: 2
     requires_target: true
+
+modules:
+  vpn_tunnel:
+    name: "VPN Tunnel"
+    description: "Pins the rooted host into your relay mesh. Lets you fast-travel back to that foothold from anywhere in the current subnet."
+    effect: "fast_travel"
+  botnet_seed:
+    name: "Botnet Seed"
+    description: "Turns the rooted host into a traffic zombie. Each seed increases global botnet pressure and scales DDoS output."
+    effect: "botnet"
+  crypto_miner:
+    name: "Crypto Miner"
+    description: "Leaves a quiet mining worker on the rooted host. Pays passive Crypto at the start of each new subnet/day."
+    effect: "income"
+    amount: 18
+
+dynamic_events:
+  worm_spread_chance: 0.46
+  worm_cross_subnet_chance: 0.28
+  worm_corrosion_min: 1
+  worm_corrosion_max: 3
+  worm_decay: 1
+  worm_brick_threshold_base: 8
+  worm_brick_threshold_scale: 4
+  revolt_base_chance: 0.1
+  revolt_trace_scale: 0.002
+  revolt_timer_min: 2
+  revolt_timer_max: 4
+  lockdown_base_chance: 0.08
+  lockdown_pressure_scale: 0.01
+  lockdown_turns_min: 1
+  lockdown_turns_max: 3
+  forensic_scrap_min: 10
+  forensic_scrap_max: 26
+  forensic_neighbor_reveal: 2
+  forensic_module_salvage_chance: 0.18
 
 nodes:
   civilian:
@@ -121,6 +175,24 @@ nodes:
     repair_min: 0
     repair_max: 3
     difficulty_bonus: 6
+  lab:
+    reward_min: 44
+    reward_max: 78
+    repair_min: 0
+    repair_max: 3
+    difficulty_bonus: 6
+  relay:
+    reward_min: 38
+    reward_max: 68
+    repair_min: 0
+    repair_max: 3
+    difficulty_bonus: 5
+  media:
+    reward_min: 32
+    reward_max: 60
+    repair_min: 0
+    repair_max: 2
+    difficulty_bonus: 5
   honeypot:
     reward_min: 30
     reward_max: 55
