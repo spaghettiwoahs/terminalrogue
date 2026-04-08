@@ -25,19 +25,24 @@ from game_text import (
     build_black_ice_tutorial_card,
     build_drone_tutorial_card,
     burn_notice_message,
+    cleanup_card,
     day_wrap_card,
     defense_notes_message,
+    lab_orientation_message,
     live_grid_card,
     live_combat_card,
     prebreach_recon_card,
     prologue_heist_message,
     run_burned_card,
     sandbox_alert_card,
+    sandbox_rules_message,
+    node_tap_card,
     sim_breach_card,
     survival_primer_message,
     tutorial_bootstrap_card,
 )
 from game_state import GameState, ThreatLedger
+from network_events import advance_dynamic_events, mark_node_bricked, seed_worm
 from payload_docs import flag_effect_lines, item_effect_lines, script_effect_lines
 
 
@@ -149,25 +154,34 @@ class TcodTerminalApp:
         "white": (239, 241, 238),
     }
     DAY_SCRIPT_UNLOCKS = {
-        1: ("ping", "hydra"),
-        2: ("nmap",),
-        3: ("enum",),
-        4: ("airmon-ng",),
-        5: ("harden",),
-        6: ("honeypot", "patch"),
-        7: ("whois", "dirb"),
-        8: ("spray", "sqlmap"),
-        9: ("spoof", "rekey"),
-        10: ("overflow", "hammer"),
-        11: ("canary", "sinkhole", "shred"),
+        0: ("ping", "hydra"),
+        6: ("nmap",),
+        12: ("enum",),
+        16: ("masscan",),
+        18: ("airmon-ng",),
+        24: ("harden",),
+        30: ("honeypot", "patch", "jmp", "stager"),
+        36: ("buffer",),
+        38: ("whois", "dirb"),
+        48: ("spray", "sqlmap", "ddos", "siphon"),
+        58: ("spoof", "rekey"),
+        70: ("overflow", "hammer"),
+        84: ("canary", "sinkhole", "shred"),
     }
     DAY_FLAG_UNLOCKS = {
-        1: ("--burst",),
-        3: ("--stealth",),
-        8: ("--ghost",),
-        11: ("--worm",),
-        12: ("--fork", "--volatile"),
-        13: ("--ransom",),
+        0: ("--burst",),
+        14: ("--stealth",),
+        42: ("--ghost",),
+        66: ("--cascade",),
+        72: ("--worm",),
+        86: ("--fork", "--volatile"),
+        96: ("--ransom",),
+    }
+    DAY_META_UNLOCKS = {
+        24: ("dry_run",),
+        34: ("subnet_travel",),
+        44: ("pattern_cache",),
+        58: ("supercruise",),
     }
 
     def __init__(self):
@@ -192,6 +206,7 @@ class TcodTerminalApp:
         self.player = None
         self.arsenal = None
         self.current_enemy = None
+        self.active_tap_node_index = None
         self.item_library = {}
 
         initial_objective = boot_layout_card()
@@ -208,10 +223,14 @@ class TcodTerminalApp:
         self.map_active = None
         self.map_status = "Awaiting active subnet."
         self.databank_lines = ["TOOLS", " booting...", "", "FLAGS", " offline"]
+        self.shop_databank_entries = {}
         self.route_sweep_level = 0
         self.route_sweep_max = 0
         self.combat_engine = None
         self.dev_console_requested = False
+        self.return_to_menu_requested = False
+        self.selected_save_reference = None
+        self.active_save_reference = None
 
     @staticmethod
     def databank_role_label(kind: str, entry_id: str, data: dict) -> str:
@@ -370,67 +389,7 @@ class TcodTerminalApp:
             return shell_command
 
         if lowered == "help":
-            help_text = (
-                "\n\033[93m=== SYSTEM HELP ===\033[0m\n"
-                "\033[96m[SHELL]\033[0m\n"
-                " pwd, ls, cat, history, whoami, hostname, uname, and date work like local shell helpers.\n"
-                " dev opens the live developer console in a separate desktop window.\n"
-                " Try: ls ~/proc   cat ~/proc/player   cat ~/usr/share/databank   cat ~/var/log/session.log\n"
-                " clear wipes the visible terminal outside live combat. Use cls or reset-terminal anywhere.\n"
-                " Type man shell or man <shell-command> for a detailed terminal page.\n\n"
-                "\033[96m[COMBAT QUEUE]\033[0m\n"
-                " Type scripts to add them to the queue (Costs RAM).\n"
-                " RAM no longer fully resets every turn. It recovers gradually from [MEM].\n"
-                " Type execute to run the queue, or clear to empty it.\n"
-                " Type disconnect to flee an encounter and eat the penalty.\n"
-                " Type use <item> or use <item> -target <SUB> to spend one-use gear.\n"
-                " Repeating loud brute-force lines teaches the host your cadence. Mix scripts or use --stealth.\n"
-                " Type man <script/flag/item> for a full payload page.\n"
-                " Type man classes, man ram, man recon, man defense, or man commands for deeper docs.\n\n"
-                "\033[96m[SCRIPT CLASSES]\033[0m\n"
-                " scan = topology, ownership, service, or process telemetry.\n"
-                " brute-force = loud direct pressure against an exposed lane.\n"
-                " exploit = abuse of a specific exposed service or access path.\n"
-                " utility = defense, recovery, recon denial, and board control.\n\n"
-                "\033[96m[PRE-BREACH RECON]\033[0m\n"
-                " Hostile nodes open in a recon shell before combat.\n"
-                " Type engage for a cold breach, or run recon scripts first and risk alerting the host.\n\n"
-                "\033[96m[RECON LOOP]\033[0m\n"
-                " No enemy intel is guaranteed by default.\n"
-                " nmap = port map, service banners, and host layout.\n"
-                " enum -target <SUB> = exact telemetry and live hostile intent on one subsystem.\n"
-                " whois = operator and allocation metadata.\n"
-                " dirb -target <SUB> = endpoint discovery on one subsystem.\n"
-                " Add --stealth to recon scripts to reduce exposure.\n"
-                " enum -target NET maps traffic rhythm and primes a quiet window for your next recon action.\n"
-                " airmon-ng -target SEC peels back perimeter controls.\n"
-                " nmap -target <SUB> becomes deeper fingerprinting once the perimeter is open.\n"
-                " Hostile nodes can scan you back. Use honeypot before a scan or spoof after a lock-on lands.\n\n"
-                "\033[96m[SUBSYSTEMS]\033[0m\n"
-                " SEC = perimeter and access-control layer.\n"
-                " NET = routing, recon, trace, and disconnect capability.\n"
-                " MEM = RAM recovery, runtime stability, and effective RAM ceiling.\n"
-                " STO = storage, loot, archives, and cached value.\n"
-                " OS = core execution plane and primary kill target.\n\n"
-                "\033[96m[ACTIVE DEFENSE]\033[0m\n"
-                " harden -target <SUB> wraps a subsystem in a temporary ACL shell.\n"
-                " honeypot feeds the next hostile scan false telemetry.\n"
-                " canary -target <SUB> punishes a correctly predicted hostile move there.\n\n"
-                " sinkhole -target <SUB> reroutes the next hostile move back into its source.\n"
-                " rekey clears RAM locks and peels back one layer of hostile recon.\n\n"
-                "\033[96m[RUN EXPLOITS]\033[0m\n"
-                " Each run seeds a different exploit deck.\n"
-                " Exploits are real script chains with conditions, not passive bonuses.\n"
-                " Mix recon, breach, and pressure scripts to discover them.\n"
-                " Type man exploit to see the signatures you've already learned.\n\n"
-                "\033[96m[SYNTAX]\033[0m\n"
-                " format:  <script> <flags> -target <SUBSYSTEM>\n"
-                " example: hydra --worm --ransom -target MEM\n\n"
-                " burst flags hit harder but louder. fork flags split pressure across another subsystem.\n\n"
-                " Note: Attacks default to hitting [OS] if no target is specified.\n"
-                " Destroying the [OS] module instantly wins the encounter.\n\n"
-            )
-            self.write(help_text)
+            self.write(self.build_dynamic_help_text())
             return True
 
         if lowered == "dev":
@@ -548,6 +507,14 @@ class TcodTerminalApp:
             width = len(str(len(self.command_history)))
             lines = [f"{index:>{width}}  {value}" for index, value in enumerate(self.command_history, start=1)]
             self.write("\n".join(lines) + "\n")
+            return True
+
+        if name == "contracts":
+            self.write(self.build_shell_contracts_text().rstrip("\n") + "\n")
+            return True
+
+        if name in {"domains", "estate"}:
+            self.write(self.build_shell_domains_text().rstrip("\n") + "\n")
             return True
 
         if name == "whoami":
@@ -686,7 +653,7 @@ class TcodTerminalApp:
     def get_virtual_tree(self):
         return {
             "~": ["proc/", "net/", "usr/", "var/"],
-            "~/proc": ["player", "target", "objective", "architecture"],
+            "~/proc": ["player", "target", "objective", "architecture", "contracts", "domains"],
             "~/net": ["routeweb"],
             "~/usr": ["share/"],
             "~/usr/share": ["databank", "manuals"],
@@ -708,6 +675,8 @@ class TcodTerminalApp:
             "~/proc/target": self.build_shell_target_text,
             "~/proc/objective": self.build_shell_objective_text,
             "~/proc/architecture": self.build_shell_architecture_text,
+            "~/proc/contracts": self.build_shell_contracts_text,
+            "~/proc/domains": self.build_shell_domains_text,
             "~/net/routeweb": self.build_shell_route_text,
             "~/usr/share/databank": self.build_shell_databank_text,
             "~/usr/share/manuals": self.build_shell_manual_index_text,
@@ -725,34 +694,45 @@ class TcodTerminalApp:
 
         player = self.player
         ram_max = player.get_effective_max_ram()
-        lines = [
-            f"HANDLE      {player.handle}",
-            f"TITLE       {player.title}",
-            f"IP          {player.local_ip}",
-            f"RAM         {player.current_ram}/{ram_max}",
-            f"RECOVERY    {player.get_ram_regen()}/turn from MEM",
-            f"SIGNATURE   {player.signature_subsystem}",
-            f"WALLET      {self.state.player_crypto}c",
-            f"TRACE       {self.state.trace_level}",
-            "",
-        ]
-        for left, right in [("OS", "SEC"), ("NET", "MEM")]:
-            left_sub = player.subsystems[left]
-            right_sub = player.subsystems[right]
-            lines.append(
-                f"{left:<3} {left_sub.current_hp:>2}/{left_sub.max_hp:<2}   "
-                f"{right:<3} {right_sub.current_hp:>2}/{right_sub.max_hp:<2}"
-            )
+        projection = None
+        if self.combat_engine:
+            snapshot = getattr(self.combat_engine, "planning_snapshot", None)
+            if snapshot:
+                projection = snapshot.get("projection")
+        defense_text = player.get_defense_summary().replace("DEFENSE     ", "")
+        cache_text = player.get_hardening_summary() if player.adaptive_hardening_active else ""
+        bot_text = player.get_support_bot_summary().replace("BOT BAY     ", "")
+        item_text = player.get_consumable_summary()
         sto = player.subsystems["STO"]
-        lines.append(f"STO {sto.current_hp:>2}/{sto.max_hp:<2}")
-        lines.extend(
-            [
-                "",
-                player.get_defense_summary(),
-                player.get_support_bot_summary(),
-                f"ITEMS       {player.get_consumable_summary()}",
-            ]
-        )
+        lines = [
+            f"RIG         {player.handle} // {player.title}",
+            f"RAM         {player.current_ram}/{ram_max}   REGEN {player.get_ram_regen()}/turn   SIG {player.signature_subsystem}",
+            f"IP          {player.local_ip}",
+            (
+                f"OS {player.subsystems['OS'].current_hp:>2}/{player.subsystems['OS'].max_hp:<2}   "
+                f"SEC {player.subsystems['SEC'].current_hp:>2}/{player.subsystems['SEC'].max_hp:<2}"
+            ),
+            (
+                f"NET {player.subsystems['NET'].current_hp:>2}/{player.subsystems['NET'].max_hp:<2}   "
+                f"MEM {player.subsystems['MEM'].current_hp:>2}/{player.subsystems['MEM'].max_hp:<2}   "
+                f"STO {sto.current_hp:>2}/{sto.max_hp:<2}"
+            ),
+            f"DEFENSE     {defense_text}",
+            f"CACHE       {cache_text or ('PRIMING' if player.adaptive_hardening_active else 'OFFLINE')}",
+            f"BOTS        {bot_text}",
+            f"ITEMS       {item_text}",
+        ]
+        if projection and projection.projected_player and projection.steps:
+            ghost_player = projection.projected_player
+            ram_delta = ghost_player.current_ram - player.current_ram
+            lines.append(
+                f"STACK DELTA {ram_delta:+d} RAM  {'LEGAL' if projection.legal else 'FAULT'}"
+            )
+            detail_bits = []
+            if projection.root_prediction:
+                detail_bits.append(f"OUTCOME {projection.root_prediction.upper()}")
+            if detail_bits:
+                lines.append("DETAIL      " + " | ".join(detail_bits))
         return "\n".join(lines)
 
     def build_shell_target_text(self):
@@ -799,6 +779,9 @@ class TcodTerminalApp:
         lines.append("SUBSYSTEMS")
         for key in ("OS", "SEC", "NET", "MEM", "STO"):
             lines.append(self.build_shell_enemy_detail_row(enemy, key))
+        lines.append("")
+        lines.append("BUSES")
+        lines.extend(enemy.get_bus_report_lines())
         return "\n".join(lines)
 
     @staticmethod
@@ -836,6 +819,48 @@ class TcodTerminalApp:
             lines.extend(["", f"TRY: {self.objective_command}"])
         if self.objective_detail:
             lines.append(f"WHY: {self.objective_detail}")
+        active_contract_lines = self.state.get_active_contract_summary_lines() if self.state else []
+        if active_contract_lines:
+            lines.extend(["", *active_contract_lines])
+        return "\n".join(lines)
+
+    def build_shell_contracts_text(self):
+        if not self.state:
+            return "ACTIVE CONTRACTS\n\nno live session state"
+        tracked = self.state.get_accepted_contracts()
+        inbox = list(self.state.current_contracts)
+        lines = ["ACTIVE CONTRACTS"]
+        if tracked:
+            for contract in tracked[:8]:
+                lines.append(
+                    f"- tracking {contract['target_ip']} // {contract['type']} // {contract['reward']}c"
+                )
+            if len(tracked) > 8:
+                lines.append(f"- +{len(tracked) - 8} more tracked")
+        else:
+            lines.append("- none")
+        if inbox:
+            lines.extend(["", "MAIL INBOX"])
+            for contract in inbox[:6]:
+                lines.append(
+                    f"- available {contract['target_ip']} // {contract['type']} // {contract['reward']}c"
+                )
+            if len(inbox) > 6:
+                lines.append(f"- +{len(inbox) - 6} more waiting")
+        return "\n".join(lines)
+
+    def build_shell_domains_text(self):
+        if not self.state:
+            return "ROOTED DOMAINS\n\n- none"
+        inventory = []
+        for module_id, count in sorted(self.state.module_inventory.items()):
+            inventory.append(f"{module_id} x{count}")
+        lines = self.state.get_rooted_domain_summary_lines(limit=10)
+        if inventory:
+            lines.extend(["", "MODULE INVENTORY", *[f"- {entry}" for entry in inventory]])
+        botnet_power = self.state.get_domain_botnet_power()
+        if botnet_power:
+            lines.extend(["", f"BOTNET POWER {botnet_power}"])
         return "\n".join(lines)
 
     def build_shell_architecture_text(self):
@@ -863,15 +888,12 @@ class TcodTerminalApp:
             "",
         ]
         if enemy.topology_revealed:
-            lines.extend(
-                [
-                    "recon ladder:",
-                    " nmap -> surface banner + layout",
-                    " enum -target <SUB> -> exact hp + move name",
-                    " airmon-ng -target SEC -> open firewall",
-                    " nmap -target <SUB> -> fingerprint weakness",
-                ]
-            )
+            lines.append("bus fabric:")
+            lines.extend(enemy.get_bus_report_lines())
+            lines.append("")
+            lines.append("open services:")
+            for entry in enemy.get_surface_report_lines():
+                lines.append(entry.strip())
         else:
             lines.append("blind tap. no topology yet.")
         return "\n".join(lines)
@@ -883,67 +905,637 @@ class TcodTerminalApp:
             return "awaiting route mesh..."
 
         world = self.map_world
-        lines = [world.subnet_name, self.map_status or "mesh idle", ""]
-        depths = {}
-        for index, node in enumerate(world.nodes):
-            depth = world.node_depths.get(index, 1)
-            depths.setdefault(depth, []).append((index, node))
+        focus_index = self.map_active
+        if focus_index is None:
+            focus_index = min(world.entry_links) if world.entry_links else 0
+        focus_node = world.nodes[focus_index]
+        lines = [
+            world.subnet_name,
+            self.map_status or "mesh idle",
+        ]
 
-        for depth in sorted(depths):
-            lines.append(f"[layer {depth}]")
-            for index, node in depths[depth]:
-                status = self.get_node_status_text(index, node, self.map_cleared)
-                label = node.ip_address
-                if node.node_type == "shop":
-                    label += "  market"
-                elif node.node_type == "gatekeeper":
-                    label += "  final"
-                else:
-                    label += f"  {self.get_node_scan_label(getattr(node, 'cached_enemy', None)).strip().lower()}"
-                lines.append(f" {status:<8} {label}")
-                intel = self.build_node_intel_summary(node)
-                if status == "LOCKED":
-                    unlock_sources = [world.nodes[source].ip_address for source in world.get_unlock_sources(index)]
-                    if unlock_sources:
-                        intel = "route via " + " / ".join(unlock_sources[:2])
+        if self.map_network and self.map_subnet_id:
+            subnet = self.map_network.get_subnet(self.map_subnet_id)
+            if subnet:
+                domain = self.map_network.get_domain(subnet.domain_id)
+                lines.extend(
+                    [
+                        "",
+                        "[macro]",
+                        f" domain {domain.name if domain else subnet.domain_id}",
+                        f" subnet {subnet.subnet_id} // {'conquered' if subnet.is_conquered() else 'active'}",
+                    ]
+                )
+                if self.has_standard_travel_unlock():
+                    neighbors = self.map_network.neighboring_subnet_ids(subnet.subnet_id)
+                    if neighbors:
+                        lines.extend(["", "[adjacent]"])
+                        for subnet_id in sorted(neighbors):
+                            linked_subnet = self.map_network.get_subnet(subnet_id)
+                            if not linked_subnet:
+                                continue
+                            state = "open" if subnet.is_conquered() else "sealed"
+                            if linked_subnet.is_conquered():
+                                state = "conquered"
+                            lines.append(f" {subnet_id:<4} {linked_subnet.subnet_name:<18} {state}")
+
+        lines.extend(
+            [
+                "",
+                "[focus]",
+                f" {self.describe_shell_route_node(world, focus_index, focus_node)}",
+                f" depth {world.node_depths.get(focus_index, 1)}",
+            ]
+        )
+
+        active_intel = self.build_node_intel_summary(focus_node)
+        if active_intel:
+            lines.append(f"  {active_intel}")
+
+        lines.extend(["", "[ingress]"])
+        if focus_index in world.entry_links:
+            lines.append(" <- shell uplink // public route hop")
+        inbound = world.get_inbound_hops(focus_index)
+        if not inbound and focus_index not in world.entry_links:
+            lines.append(" none")
+        else:
+            for node_index in inbound:
+                lines.append(f" <- {self.describe_shell_route_node(world, node_index, world.nodes[node_index])}")
+
+        lines.extend(["", "[egress]"])
+        outbound = world.get_outbound_hops(focus_index)
+        if not outbound:
+            lines.append(" none")
+        else:
+            for node_index in outbound:
+                node = world.nodes[node_index]
+                lines.append(f" -> {self.describe_shell_route_node(world, node_index, node)}")
+                intel = self.describe_shell_route_secondary(world, focus_index, node_index, node)
                 if intel:
-                    lines.append(f"          {intel}")
-            lines.append("")
+                    lines.append(f"    {intel}")
+                fanout = world.get_outbound_hops(node_index)
+                if fanout:
+                    preview = ", ".join(self.describe_shell_route_short_label(world, idx) for idx in fanout[:3])
+                    lines.append(f"    fanout: {preview}")
 
-        lines.append("mail = dead-drop inbox")
-        lines.append("bot = bot bay")
         return "\n".join(lines)
+
+    def describe_shell_route_node(self, world, node_index, node):
+        status = self.get_node_status_text(node_index, node, self.map_cleared)
+        label = self.describe_shell_route_label(world, node_index, node)
+        depth = world.node_depths.get(node_index, 1)
+        if label == node.ip_address:
+            return f"{label} [{status}] d{depth}"
+        return f"{label} @ {node.ip_address} [{status}] d{depth}"
+
+    def describe_shell_route_secondary(self, world, focus_index, node_index, node):
+        status = self.get_node_status_text(node_index, node, self.map_cleared)
+        if status == "LOCKED":
+            return "route sealed"
+        return self.build_node_intel_summary(node)
+
+    def describe_shell_route_label(self, world, node_index, node):
+        if node.node_type == "shop":
+            return "market relay"
+        enemy = getattr(node, "cached_enemy", None)
+        if enemy and enemy.identity_revealed:
+            return enemy.get_visible_name().split("[")[0].strip()
+        if node_index in self.map_cleared and enemy and enemy.topology_revealed:
+            scanned = self.get_node_scan_label(enemy).strip()
+            if scanned and scanned not in {"HOSTILE", "SCANNED"}:
+                return scanned.title()
+        return node.ip_address
+
+    def describe_shell_route_short_label(self, world, node_index):
+        label = self.describe_shell_route_label(world, node_index, world.nodes[node_index])
+        if label == world.nodes[node_index].ip_address:
+            return label.split(".")[-1]
+        return label[:14]
 
     def build_shell_databank_text(self):
         return "\n".join(self.databank_lines)
 
-    def build_shell_manual_index_text(self):
-        lines = [
-            "manual topics",
-            "",
-            " man shell",
-            " man commands",
-            " man flags",
-            " man classes",
-            " man ram",
-            " man recon",
-            " man defense",
-            " man subsystems",
-            "",
-            "shell commands",
-            "",
-            " man pwd",
-            " man ls",
-            " man cat",
-            " man history",
-            " man whoami",
-            " man hostname",
-            " man uname",
-            " man date",
-            " man clear",
-            " man reset-terminal",
-            " man dev",
+    def get_installed_script_ids(self):
+        if not self.arsenal:
+            return []
+        if not self.player:
+            return list(self.arsenal.scripts.keys())
+        return [script_id for script_id in self.arsenal.scripts if self.player.owns_script(script_id)]
+
+    def get_installed_flag_ids(self):
+        if not self.arsenal:
+            return []
+        if not self.player:
+            return list(self.arsenal.flags.keys())
+        return [flag_id for flag_id in self.arsenal.flags if self.player.owns_flag(flag_id)]
+
+    def get_visible_item_ids(self):
+        if not self.item_library:
+            return []
+        if not self.player:
+            return sorted(self.item_library.keys())
+        return [
+            item_id
+            for item_id in sorted(self.item_library)
+            if self.player.get_consumable_count(item_id) > 0
         ]
+
+    @staticmethod
+    def _split_completion_input(text: str):
+        raw = text or ""
+        parts = raw.split()
+        if raw.endswith(" "):
+            parts.append("")
+        return parts
+
+    @staticmethod
+    def _filter_completion_matches(candidates, prefix: str):
+        seen = set()
+        matches = []
+        lowered_prefix = (prefix or "").lower()
+        for candidate in candidates:
+            if not candidate:
+                continue
+            if candidate in seen:
+                continue
+            if lowered_prefix and not str(candidate).lower().startswith(lowered_prefix):
+                continue
+            seen.add(candidate)
+            matches.append(candidate)
+        exact = lowered_prefix
+        return sorted(matches, key=lambda value: (str(value).lower() != exact, str(value).lower()))
+
+    def get_completion_subsystem_tokens(self):
+        if self.player and getattr(self.player, "subsystems", None):
+            return list(self.player.subsystems.keys())
+        return ["OS", "SEC", "NET", "MEM", "STO"]
+
+    def get_visible_manual_target_ids(self):
+        visible = []
+        seen = set()
+
+        def add(token: str):
+            if not token:
+                return
+            if token in seen:
+                return
+            seen.add(token)
+            visible.append(token)
+
+        for line in self.get_visible_manual_topics():
+            stripped = line.strip()
+            if stripped.startswith("man "):
+                add(stripped[4:].strip())
+
+        add("exploit")
+        add("items")
+        for subsystem in self.get_completion_subsystem_tokens():
+            add(subsystem.lower())
+        for script_id in self.get_installed_script_ids():
+            add(script_id)
+        for flag_id in self.get_installed_flag_ids():
+            add(flag_id)
+        for item_id in self.get_visible_item_ids():
+            add(item_id)
+        return visible
+
+    def get_virtual_path_candidates(self):
+        tree = self.get_virtual_tree()
+        alias_tokens = [
+            "player",
+            "target",
+            "objective",
+            "architecture",
+            "route",
+            "routeweb",
+            "databank",
+            "manuals",
+            "session.log",
+            "history.log",
+        ]
+        candidates = set(alias_tokens)
+        for path, entries in tree.items():
+            candidates.add(path)
+            for entry in entries:
+                entry_name = entry.rstrip("/")
+                candidates.add(entry_name)
+                if path == "~":
+                    candidates.add(f"~/{entry_name}")
+                else:
+                    candidates.add(f"{path}/{entry_name}".replace("//", "/"))
+        for path in (
+            "~/proc/player",
+            "~/proc/target",
+            "~/proc/objective",
+            "~/proc/architecture",
+            "~/proc/contracts",
+            "~/proc/domains",
+            "~/net/routeweb",
+            "~/usr/share/databank",
+            "~/usr/share/manuals",
+            "~/var/log/session.log",
+            "~/var/log/history.log",
+        ):
+            candidates.add(path)
+        return sorted(candidates)
+
+    def get_route_completion_node_ids(self):
+        if not self.state or not getattr(self.state, "active_network", None):
+            return []
+        network = self.state.active_network
+        current_subnet = network.get_subnet(self.state.current_subnet_id or network.entry_subnet_id)
+        if not current_subnet:
+            return []
+        world = current_subnet.world_map
+        cleared_nodes = current_subnet.cleared_nodes
+        current_anchor = current_subnet.current_anchor
+        matches = []
+        for index, node in enumerate(world.nodes):
+            if index in cleared_nodes:
+                can_revisit = world.can_traverse_from(current_anchor, index, cleared_nodes)
+                can_fast_travel = self.state.can_fast_travel_to(node)
+                if can_revisit or can_fast_travel:
+                    matches.append(node.ip_address.lower())
+            elif world.can_traverse_from(current_anchor, index, cleared_nodes):
+                matches.append(node.ip_address.lower())
+        return self._filter_completion_matches(matches, "")
+
+    def get_active_tap_context(self, current_subnet, enemies_data=None, modifiers=None, ability_library=None):
+        tap_index = self.active_tap_node_index
+        if tap_index is None or not current_subnet:
+            return None, None, None
+        world = current_subnet.world_map
+        if tap_index < 0 or tap_index >= len(world.nodes):
+            self.active_tap_node_index = None
+            self.current_enemy = None
+            return None, None, None
+        if tap_index != current_subnet.current_anchor:
+            self.active_tap_node_index = None
+            self.current_enemy = None
+            return None, None, None
+        if tap_index in current_subnet.cleared_nodes:
+            self.active_tap_node_index = None
+            self.current_enemy = None
+            return None, None, None
+
+        node = world.nodes[tap_index]
+        if getattr(node, "compromise_state", "") in {"rooted", "bricked"} or node.node_type == "shop":
+            self.active_tap_node_index = None
+            self.current_enemy = None
+            return None, None, None
+
+        enemy = self.current_enemy
+        if enemies_data is not None and ability_library is not None:
+            enemy = self.build_enemy_for_node(node, enemies_data, modifiers or {}, ability_library)
+            self.current_enemy = enemy
+        return tap_index, node, enemy
+
+    def get_standard_travel_completion_tokens(self):
+        if not self.state or not getattr(self.state, "active_network", None):
+            return []
+        network = self.state.active_network
+        current_subnet = network.get_subnet(self.state.current_subnet_id or network.entry_subnet_id)
+        if not current_subnet:
+            return []
+        candidates = []
+        for subnet_id in sorted(current_subnet.neighbors):
+            subnet = network.get_subnet(subnet_id)
+            if not subnet:
+                continue
+            candidates.append(subnet.subnet_id.lower())
+            candidates.append(subnet.subnet_name.lower().replace(" ", "_"))
+        return self._filter_completion_matches(candidates, "")
+
+    def get_supercruise_completion_tokens(self):
+        if not self.state or not getattr(self.state, "active_network", None):
+            return []
+        network = self.state.active_network
+        current_subnet_id = self.state.current_subnet_id or network.entry_subnet_id
+        candidates = []
+        for subnet_id, subnet in sorted(network.subnets.items()):
+            if subnet_id == current_subnet_id:
+                continue
+            candidates.append(subnet.subnet_id.lower())
+            candidates.append(subnet.subnet_name.lower().replace(" ", "_"))
+        for domain_id, domain in sorted(network.domains.items()):
+            candidates.append(domain_id.lower())
+            candidates.append(domain.name.lower().replace(" ", "_"))
+        candidates.extend(["current", "active", "here"])
+        return self._filter_completion_matches(candidates, "")
+
+    def get_shell_command_completion_matches(self, text: str):
+        shell_roots = [
+            "help",
+            "dev",
+            "man",
+            "pwd",
+            "ls",
+            "cat",
+            "history",
+            "contracts",
+            "domains",
+            "whoami",
+            "hostname",
+            "uname",
+            "date",
+            "clear",
+            "cls",
+            "reset-terminal",
+        ]
+        parts = self._split_completion_input(text)
+        token = parts[-1] if parts else ""
+        if len(parts) <= 1:
+            return self._filter_completion_matches(shell_roots, token)
+
+        name = parts[0].lower()
+        if name == "man":
+            return self._filter_completion_matches(self.get_visible_manual_target_ids(), token)
+        if name in {"ls", "cat"}:
+            return self._filter_completion_matches(self.get_virtual_path_candidates(), token)
+        if name == "uname":
+            return self._filter_completion_matches(["-a"], token)
+        return []
+
+    def get_payload_completion_matches(self, text: str, *, include_use: bool = True):
+        parts = self._split_completion_input(text)
+        token = parts[-1] if parts else ""
+        installed_scripts = self.get_installed_script_ids()
+        visible_items = self.get_visible_item_ids()
+
+        if len(parts) <= 1:
+            roots = list(installed_scripts)
+            if include_use and visible_items:
+                roots.append("use")
+            return self._filter_completion_matches(roots, token)
+
+        name = parts[0].lower()
+        if name == "use" and include_use:
+            if len(parts) == 2:
+                return self._filter_completion_matches(visible_items, token)
+            item_id = parts[1]
+            item_data = self.item_library.get(item_id, {}) if self.item_library else {}
+            supports_target = bool(item_data.get("needs_target") or item_data.get("targetable") or item_data.get("default_target"))
+            if not supports_target:
+                return []
+            if len(parts) >= 3 and parts[-2].lower() == "-target":
+                return self._filter_completion_matches(self.get_completion_subsystem_tokens(), token.upper())
+            candidates = []
+            if "-target" not in [part.lower() for part in parts[2:]]:
+                candidates.append("-target")
+            return self._filter_completion_matches(candidates, token)
+
+        if not self.arsenal or name not in self.arsenal.scripts:
+            return []
+
+        script_data = self.arsenal.scripts.get(name, {})
+        supports_target = script_data.get("supports_target", True)
+        used_flags = {part for part in parts[1:] if part.startswith("--")}
+        has_target = any(part.lower() == "-target" for part in parts[1:])
+        if len(parts) >= 3 and parts[-2].lower() == "-target":
+            return self._filter_completion_matches(self.get_completion_subsystem_tokens(), token.upper())
+
+        candidates = []
+        if supports_target and not has_target:
+            candidates.append("-target")
+        candidates.extend(
+            flag_id
+            for flag_id in self.arsenal.get_owned_allowed_flags(name, owner=self.player)
+            if flag_id not in used_flags
+        )
+        return self._filter_completion_matches(candidates, token)
+
+    def get_terminal_completion_matches(self, text: str):
+        prompt = (self.active_prompt or "").strip().lower()
+        parts = self._split_completion_input(text)
+        token = parts[-1] if parts else ""
+        shell_roots = self.get_shell_command_completion_matches(text) if len(parts) <= 1 else []
+        if len(parts) > 1 and parts[0].lower() in {
+            "help",
+            "dev",
+            "man",
+            "pwd",
+            "ls",
+            "cat",
+            "history",
+            "contracts",
+            "domains",
+            "whoami",
+            "hostname",
+            "uname",
+            "date",
+            "clear",
+            "cls",
+            "reset-terminal",
+        }:
+            return self.get_shell_command_completion_matches(text)
+
+        context_candidates = []
+        if "root@player:~$" in prompt:
+            context_candidates = ["execute", "clear", "disconnect", "exit", "wait", "pass", "defend", "repair"]
+            if self.state and self.state.has_meta("dry_run"):
+                context_candidates.append("dry_run")
+            if len(parts) <= 1:
+                context_candidates.extend(self.get_payload_completion_matches(text, include_use=True))
+            elif parts[0].lower() in {"defend", "repair"}:
+                return self._filter_completion_matches(self.get_completion_subsystem_tokens(), token)
+            else:
+                payload_matches = self.get_payload_completion_matches(text, include_use=True)
+                return payload_matches or self.get_shell_command_completion_matches(text)
+        elif "recon@link:~$" in prompt:
+            if len(parts) <= 1:
+                context_candidates = ["engage", "soft engage", "disconnect", "exit"]
+                context_candidates.extend(self.get_payload_completion_matches(text, include_use=False))
+            elif len(parts) == 2 and parts[0].lower() == "soft":
+                context_candidates = ["engage"]
+            else:
+                payload_matches = self.get_payload_completion_matches(text, include_use=False)
+                return payload_matches or self.get_shell_command_completion_matches(text)
+        elif "cleanup@node:~$" in prompt:
+            context_candidates = ["status", "scrub", "forensics", "done", "exit", "leave"]
+        elif self.active_tap_node_index is not None or "tap@" in prompt or "hop@" in prompt:
+            if len(parts) <= 1:
+                context_candidates = ["recon", "engage", "soft engage", "leave", "bot", "mail", "s"]
+                if self.has_standard_travel_unlock():
+                    context_candidates.extend(["subnets", "travel"])
+                if self.has_supercruise_unlock():
+                    context_candidates.append("supercruise")
+                context_candidates.extend(self.get_route_completion_node_ids())
+                context_candidates.extend(self.get_payload_completion_matches(text, include_use=False))
+            elif len(parts) == 2 and parts[0].lower() == "soft":
+                context_candidates = ["engage"]
+            elif parts[0].lower() == "travel" and self.has_standard_travel_unlock():
+                return self._filter_completion_matches(self.get_standard_travel_completion_tokens(), token)
+            elif parts[0].lower() == "supercruise" and self.has_supercruise_unlock():
+                return self._filter_completion_matches(self.get_supercruise_completion_tokens(), token)
+            else:
+                payload_matches = self.get_payload_completion_matches(text, include_use=False)
+                if payload_matches:
+                    return payload_matches
+        elif "select node ip or route command:" in prompt:
+            if len(parts) <= 1:
+                context_candidates = ["bot", "mail", "s"]
+                if self.has_standard_travel_unlock():
+                    context_candidates.extend(["subnets", "travel"])
+                if self.has_supercruise_unlock():
+                    context_candidates.append("supercruise")
+                context_candidates.extend(self.get_route_completion_node_ids())
+            elif parts[0].lower() == "travel" and self.has_standard_travel_unlock():
+                return self._filter_completion_matches(self.get_standard_travel_completion_tokens(), token)
+            elif parts[0].lower() == "supercruise" and self.has_supercruise_unlock():
+                return self._filter_completion_matches(self.get_supercruise_completion_tokens(), token)
+        elif "open contract #:" in prompt:
+            total = len(self.state.get_accepted_contracts()) + len(self.state.current_contracts) if self.state else 0
+            context_candidates = [str(index) for index in range(1, total + 1)]
+        elif "select a purchase:" in prompt:
+            stock_size = len(self.shop_databank_entries)
+            context_candidates = [str(index) for index in range(1, stock_size + 2)] if stock_size else []
+        elif "install module #:" in prompt:
+            module_count = len(self.state.module_inventory) if self.state and self.state.module_inventory else 0
+            context_candidates = [str(index) for index in range(1, module_count + 1)]
+            context_candidates.append("a")
+        elif "select bot to configure:" in prompt:
+            bot_count = len(self.player.support_bots) if self.player else 0
+            context_candidates = [str(index) for index in range(1, bot_count + 1)]
+        elif "target subsystem" in prompt:
+            context_candidates = self.get_completion_subsystem_tokens()
+        elif "run cadence in turns" in prompt:
+            context_candidates = ["1", "2", "3", "4"]
+        elif "select an option:" in prompt:
+            context_candidates = ["1", "2", "3", "4"]
+
+        return self._filter_completion_matches([*shell_roots, *context_candidates], token)
+
+    def has_any_installed_script(self, script_ids):
+        installed = set(self.get_installed_script_ids())
+        return any(script_id in installed for script_id in script_ids)
+
+    def has_seen_bricked_node(self):
+        if self.map_world and any(getattr(node, "compromise_state", "") == "bricked" for node in self.map_world.nodes):
+            return True
+        if self.state and getattr(self.state, "active_network", None):
+            for subnet in self.state.active_network.subnets.values():
+                if any(getattr(node, "compromise_state", "") == "bricked" for node in subnet.world_map.nodes):
+                    return True
+        return False
+
+    def is_manual_topic_visible(self, topic: str):
+        topic = self.normalize_manual_topic(topic)
+        always_visible = {"shell", "commands", "classes", "subsystems", "ram", "phases", "trace", "noise", "sweep", "buses", "os", "sec", "net", "mem", "sto"}
+        if topic in always_visible:
+            return True
+        if topic == "flags":
+            return bool(self.get_installed_flag_ids())
+        if topic in {"scan", "recon"}:
+            return self.has_any_installed_script({"nmap", "enum", "whois", "dirb"})
+        if topic == "defense":
+            return self.has_any_installed_script({"harden", "honeypot", "canary", "sinkhole", "rekey", "patch", "spoof"})
+        if topic in {"brute-force", "brute"}:
+            return any(self.arsenal.scripts[script_id].get("type") == "brute_force" for script_id in self.get_installed_script_ids())
+        if topic == "exploit":
+            return any(self.arsenal.scripts[script_id].get("type") == "exploit" for script_id in self.get_installed_script_ids())
+        if topic == "utility":
+            return any(self.arsenal.scripts[script_id].get("type") == "utility" for script_id in self.get_installed_script_ids())
+        if topic == "root":
+            return bool(self.state and self.state.rooted_domains)
+        if topic == "brick":
+            return self.has_seen_bricked_node()
+        if topic == "dry_run":
+            return bool(self.state and self.state.has_meta("dry_run"))
+        if topic == "contracts":
+            return bool(
+                self.state
+                and (self.state.current_contracts or self.state.active_contracts or self.state.contract_history)
+            )
+        if topic == "domains":
+            return bool(
+                self.state
+                and (
+                    self.state.rooted_domains
+                    or self.state.module_inventory
+                    or self.state.get_domain_botnet_power() > 0
+                )
+            )
+        return False
+
+    def get_visible_manual_topics(self):
+        topic_labels = [
+            ("shell", "man shell"),
+            ("commands", "man commands"),
+            ("classes", "man classes"),
+            ("subsystems", "man subsystems"),
+            ("ram", "man ram"),
+            ("trace", "man trace"),
+            ("noise", "man noise"),
+            ("sweep", "man sweep"),
+            ("buses", "man buses"),
+            ("phases", "man phases"),
+            ("flags", "man flags"),
+            ("recon", "man recon"),
+            ("scan", "man scan"),
+            ("defense", "man defense"),
+            ("brute-force", "man brute-force"),
+            ("exploit", "man exploit"),
+            ("utility", "man utility"),
+            ("root", "man root"),
+            ("brick", "man brick"),
+            ("dry_run", "man dry_run"),
+            ("contracts", "man contracts"),
+            ("domains", "man domains"),
+        ]
+        return [label for topic, label in topic_labels if self.is_manual_topic_visible(topic)]
+
+    def build_dynamic_help_text(self):
+        installed_scripts = self.get_installed_script_ids()
+        installed_flags = self.get_installed_flag_ids()
+        visible_topics = self.get_visible_manual_topics()
+        shell_helpers = ["pwd", "ls", "cat", "history", "whoami", "hostname", "uname", "date", "clear", "cls", "reset-terminal", "dev"]
+        if self.state and self.state.has_meta("dry_run"):
+            shell_helpers.append("dry_run")
+
+        lines = [
+            "\n\033[93m=== SYSTEM HELP ===\033[0m",
+            "\033[96m[SHELL]\033[0m",
+            " " + ", ".join(shell_helpers),
+            " cat ~/proc/player   cat ~/proc/target   cat ~/usr/share/databank   cat ~/var/log/session.log",
+            "",
+            "\033[96m[STACK]\033[0m",
+            " queue payloads in the terminal, then type execute",
+            " clear empties the stack // wait or pass yields the turn // disconnect bails out of a live hostile link",
+            " queued items resolve first as pre-flight injectors // the live stack then resolves FIFO",
+            "",
+            "\033[96m[RIG]\033[0m",
+            f" installed scripts: {', '.join(installed_scripts) if installed_scripts else 'none'}",
+            f" installed flags: {', '.join(installed_flags) if installed_flags else 'none'}",
+            "",
+            "\033[96m[MANUALS]\033[0m",
+            " man <script|flag|item|target> for an entry on something you currently know",
+        ]
+        if visible_topics:
+            lines.append(" " + "   ".join(visible_topics))
+        lines.append("")
+        return "\n".join(lines)
+
+    def build_shell_manual_index_text(self):
+        lines = ["manual topics", ""]
+        lines.extend(self.get_visible_manual_topics() or [" man shell", " man commands"])
+        lines.extend(
+            [
+                "",
+                "shell commands",
+                "",
+                " man pwd",
+                " man ls",
+                " man cat",
+                " man history",
+                " man whoami",
+                " man hostname",
+                " man uname",
+                " man date",
+                " man clear",
+                " man reset-terminal",
+                " man dev",
+            ]
+        )
         return "\n".join(lines)
 
     def build_shell_session_log_text(self):
@@ -1124,6 +1716,70 @@ class TcodTerminalApp:
                 "reset-terminal",
                 [("NAME", ["reset-terminal - same effect as cls; fully wipes the visible terminal transcript."])],
             ),
+            "wait": self.format_manual_page(
+                "wait",
+                [
+                    ("NAME", ["wait - yield the turn without committing a stack."]),
+                    (
+                        "WHAT IT DOES",
+                        [
+                            "Ends your planning phase immediately.",
+                            "Spends no RAM and commits no payloads.",
+                            "Useful when you want the next turn's RAM recovery more than a weak stack right now.",
+                        ],
+                    ),
+                ],
+            ),
+            "pass": self.format_manual_page(
+                "pass",
+                [
+                    ("NAME", ["pass - alias for wait."]),
+                    ("WHAT IT DOES", ["Exactly the same behavior as wait."]),
+                ],
+            ),
+            "defend": self.format_manual_page(
+                "defend",
+                [
+                    ("NAME", ["defend - brace one of your subsystems with a short ACL shell."]),
+                    (
+                        "SYNTAX",
+                        [
+                            "defend <OS|SEC|NET|MEM|STO>",
+                            "If no target is given, it defaults to OS.",
+                        ],
+                    ),
+                    (
+                        "WHAT IT DOES",
+                        [
+                            "Ends the turn immediately.",
+                            "Costs no RAM.",
+                            "Adds a small temporary block to the chosen subsystem for the next hostile hit.",
+                        ],
+                    ),
+                ],
+            ),
+            "repair": self.format_manual_page(
+                "repair",
+                [
+                    ("NAME", ["repair - spend the turn restoring a little integrity to your own rig."]),
+                    (
+                        "SYNTAX",
+                        [
+                            "repair <OS|SEC|NET|MEM|STO>",
+                            "If no target is given, it defaults to OS.",
+                        ],
+                    ),
+                    (
+                        "WHAT IT DOES",
+                        [
+                            "Ends the turn immediately.",
+                            "Costs no RAM.",
+                            "Restores a small amount of HP to the chosen subsystem if it is damaged.",
+                            "Repair throughput improves gradually as your run progression climbs.",
+                        ],
+                    ),
+                ],
+            ),
         }
         return manuals.get(topic)
 
@@ -1155,6 +1811,12 @@ class TcodTerminalApp:
 
     def clear_objective(self):
         self.apply_objective_card(live_grid_card())
+
+    def has_standard_travel_unlock(self):
+        return bool(self.state and self.state.has_meta("subnet_travel"))
+
+    def has_supercruise_unlock(self):
+        return bool(self.state and self.state.has_meta("supercruise"))
 
     def get_ascii_art(self, art_key: str):
         return ASCII_ART.get(art_key, "")
@@ -1191,35 +1853,238 @@ class TcodTerminalApp:
                 lines.append(f" {item_id:<12} {role}")
         lines.extend(["", "TARGETS", " OS  NET  MEM  SEC  STO"])
         self.databank_lines = lines
+        self.shop_databank_entries = {}
+
+    def clear_shop_databank(self):
+        self.shop_databank_entries = {}
+        if self.arsenal:
+            self.update_arsenal_display(self.arsenal)
+
+    def set_shop_databank(self, shop_stock, consumable_library, module_library):
+        self.shop_databank_entries = {}
+        lines = ["MARKET", " slot  offer                cost  class"]
+        for idx, offer in enumerate(shop_stock, start=1):
+            token = f"[{idx}]"
+            stock_kind = offer.get("stock_kind", offer.get("type", "misc"))
+            if stock_kind == "script":
+                class_label = "script"
+            elif stock_kind == "flag":
+                class_label = "flag"
+            elif stock_kind == "module":
+                class_label = "module"
+            elif stock_kind == "bot":
+                class_label = "bot"
+            elif stock_kind in {"heal", "ram", "trace"}:
+                class_label = "system"
+            else:
+                class_label = "item"
+
+            title = offer.get("name", offer.get("item_id", offer.get("script_id", offer.get("flag_id", offer.get("module_id", "offer")))))
+            self.shop_databank_entries[token] = {
+                "kind": "shop_offer",
+                "id": offer.get("offer_id", title),
+                "title": title,
+                "data": {
+                    **dict(offer),
+                    "consumable_library": consumable_library,
+                    "module_library": module_library,
+                },
+            }
+            lines.append(f" {token:<5} {title[:20]:<20} {offer.get('cost', 0):>4}  {class_label}")
+        self.databank_lines = lines
+
+    def script_unlock_thresholds(self):
+        mapping = {}
+        for threshold, script_ids in self.DAY_SCRIPT_UNLOCKS.items():
+            for script_id in script_ids:
+                mapping.setdefault(script_id, threshold)
+        return mapping
+
+    def flag_unlock_thresholds(self):
+        mapping = {}
+        for threshold, flag_ids in self.DAY_FLAG_UNLOCKS.items():
+            for flag_id in flag_ids:
+                mapping.setdefault(flag_id, threshold)
+        return mapping
+
+    def scaled_shop_cost(self, base_cost: int, *, weight: float = 1.0) -> int:
+        current_day = max(1, self.state.day if self.state else 1)
+        progression = self.state.get_progression_score() if self.state and hasattr(self.state, "get_progression_score") else current_day
+        scale = 1.0 + ((current_day - 1) * 0.06) + ((progression // 12) * 0.03 * weight)
+        return max(8, int(round(base_cost * scale)))
+
+    def build_shop_stock(self, events_data):
+        base_shop_items = list(events_data.get("shops", {}).items())
+        consumable_library = events_data.get("consumables", {})
+        module_library = events_data.get("modules", {})
+        if not base_shop_items:
+            return []
+
+        progression = self.state.get_progression_score() if self.state and hasattr(self.state, "get_progression_score") else self.state.day
+        current_day = max(1, self.state.day if self.state else 1)
+        tier_budget = max(progression, current_day * 4 - 2)
+        subnet_token = sum(ord(ch) for ch in str(getattr(self.state, "current_subnet_id", "") or ""))
+        node_token = int(self.map_active or 0)
+        rng = random.Random((self.state.run_seed if self.state else 0) + current_day * 101 + progression * 17 + subnet_token + (node_token * 29))
+
+        def eligible_static(item_id, item):
+            item_type = item.get("type")
+            if item_type == "heal":
+                return True
+            if item_type == "consumable":
+                return True
+            if item_type == "trace":
+                return current_day >= 2 or progression >= 6
+            if item_type == "ram":
+                return current_day >= 2 or progression >= 8
+            if item_type == "bot":
+                return current_day >= 2 or progression >= 10
+            if item_type == "module":
+                return current_day >= 3 or progression >= 14
+            return True
+
+        sustain_pool = []
+        tactical_pool = []
+        infrastructure_pool = []
+        for item_id, item in base_shop_items:
+            if not eligible_static(item_id, item):
+                continue
+            offer = dict(item)
+            offer["offer_id"] = item_id
+            offer["cost"] = self.scaled_shop_cost(item.get("cost", 0), weight=1.0 if item.get("type") != "module" else 1.25)
+            offer["stock_kind"] = item.get("type")
+            item_type = item.get("type")
+            if item_type in {"heal", "trace"} or (item_type == "consumable" and item.get("item_id") in {"ram_capsule", "failsafe_patch"}):
+                sustain_pool.append(offer)
+            elif item_type in {"module", "bot", "ram"}:
+                infrastructure_pool.append(offer)
+            else:
+                tactical_pool.append(offer)
+
+        stock = []
+        used_offer_ids = set()
+
+        def pick_from(pool):
+            available = [offer for offer in pool if offer["offer_id"] not in used_offer_ids]
+            if not available:
+                return None
+            chosen = rng.choice(available)
+            used_offer_ids.add(chosen["offer_id"])
+            return chosen
+
+        for pool in (sustain_pool, tactical_pool):
+            chosen = pick_from(pool)
+            if chosen:
+                stock.append(chosen)
+
+        if current_day >= 2 or progression >= 8:
+            chosen = pick_from(infrastructure_pool)
+            if chosen:
+                stock.append(chosen)
+
+        script_thresholds = self.script_unlock_thresholds()
+        if self.arsenal and self.player:
+            script_candidates = [
+                script_id
+                for script_id, threshold in script_thresholds.items()
+                if threshold > 0
+                and threshold <= tier_budget
+                and not self.player.owns_script(script_id)
+                and script_id in self.arsenal.scripts
+            ]
+            if script_candidates:
+                script_id = rng.choice(script_candidates)
+                script_data = self.arsenal.scripts[script_id]
+                stock.append(
+                    {
+                        "offer_id": f"script::{script_id}",
+                        "name": script_id,
+                        "stock_kind": "script",
+                        "script_id": script_id,
+                        "cost": self.scaled_shop_cost(36 + (script_data.get("ram", 0) * 18), weight=1.2),
+                    }
+                )
+
+        flag_thresholds = self.flag_unlock_thresholds()
+        if self.arsenal and self.player and (current_day >= 2 or progression >= 10):
+            flag_candidates = [
+                flag_id
+                for flag_id, threshold in flag_thresholds.items()
+                if threshold > 0
+                and threshold <= tier_budget
+                and not self.player.owns_flag(flag_id)
+                and flag_id in self.arsenal.flags
+            ]
+            if flag_candidates:
+                flag_id = rng.choice(flag_candidates)
+                flag_data = self.arsenal.flags[flag_id]
+                stock.append(
+                    {
+                        "offer_id": f"flag::{flag_id}",
+                        "name": flag_id,
+                        "stock_kind": "flag",
+                        "flag_id": flag_id,
+                        "cost": self.scaled_shop_cost(24 + (flag_data.get("ram", 0) * 16), weight=1.15),
+                    }
+                )
+
+        target_stock = 4 if current_day < 3 else 5
+        while len(stock) < target_stock:
+            chosen = pick_from(tactical_pool) or pick_from(sustain_pool) or pick_from(infrastructure_pool)
+            if not chosen:
+                break
+            stock.append(chosen)
+
+        return stock[:target_stock]
 
     def apply_day_unlocks(self, *, announce: bool = False):
         if not self.player or not self.state:
             return []
 
+        progression_score = self.state.get_progression_score() if hasattr(self.state, "get_progression_score") else self.state.day
+        meta_labels = {
+            "dry_run": "dry_run",
+            "subnet_travel": "subnet travel",
+            "pattern_cache": "pattern cache",
+            "supercruise": "supercruise",
+        }
         unlocked_lines = []
         unlocked_scripts = []
         unlocked_flags = []
+        unlocked_meta = []
 
-        for unlock_day, script_ids in sorted(self.DAY_SCRIPT_UNLOCKS.items()):
-            if self.state.day < unlock_day:
+        for unlock_threshold, script_ids in sorted(self.DAY_SCRIPT_UNLOCKS.items()):
+            if progression_score < unlock_threshold:
                 continue
             for script_id in script_ids:
                 if not self.player.owns_script(script_id):
                     self.player.grant_script(script_id)
                     unlocked_scripts.append(script_id)
 
-        for unlock_day, flag_ids in sorted(self.DAY_FLAG_UNLOCKS.items()):
-            if self.state.day < unlock_day:
+        for unlock_threshold, flag_ids in sorted(self.DAY_FLAG_UNLOCKS.items()):
+            if progression_score < unlock_threshold:
                 continue
             for flag_id in flag_ids:
                 if not self.player.owns_flag(flag_id):
                     self.player.grant_flag(flag_id)
                     unlocked_flags.append(flag_id)
 
+        for unlock_threshold, unlock_ids in sorted(self.DAY_META_UNLOCKS.items()):
+            if progression_score < unlock_threshold:
+                continue
+            for unlock_id in unlock_ids:
+                if not self.state.has_meta(unlock_id):
+                    self.state.unlock_meta(unlock_id)
+                    unlocked_meta.append(unlock_id)
+
         if unlocked_scripts:
             unlocked_lines.append(f"[UNLOCK] scripts: {', '.join(unlocked_scripts)}")
         if unlocked_flags:
             unlocked_lines.append(f"[UNLOCK] flags: {', '.join(unlocked_flags)}")
+        if unlocked_meta:
+            unlocked_lines.append(
+                f"[UNLOCK] systems: {', '.join(meta_labels.get(unlock_id, unlock_id) for unlock_id in unlocked_meta)}"
+            )
 
         if self.arsenal:
             self.update_arsenal_display(self.arsenal)
@@ -1230,10 +2095,23 @@ class TcodTerminalApp:
 
         return unlocked_lines
 
-    def set_network_world(self, world=None, cleared_nodes=None, active_index=None, status_text=None):
+    def set_network_world(
+        self,
+        world=None,
+        cleared_nodes=None,
+        active_index=None,
+        status_text=None,
+        *,
+        network=None,
+        subnet_id=None,
+        domain_id=None,
+    ):
         self.map_world = world
         self.map_cleared = set(cleared_nodes or set())
         self.map_active = active_index
+        self.map_network = network
+        self.map_subnet_id = subnet_id
+        self.map_domain_id = domain_id
         if status_text:
             self.map_status = status_text
         elif not world:
@@ -1266,23 +2144,51 @@ class TcodTerminalApp:
         return "contracts: " + " | ".join(labels)
 
     def view_contract_inbox(self, world):
-        if not self.state or not self.state.current_contracts:
+        if not self.state:
             self.clear_screen()
             print("=== DEAD DROP // CONTRACT INBOX ===\n")
-            print("[sys] Inbox empty. No buyers are whispering right now.")
+            print("[sys] Inbox offline. No session state is loaded.")
             input("[Press Enter to return to the route mesh...]")
             return
 
         while True:
             self.clear_screen()
-            active_count = len(self.state.get_accepted_contracts())
+            tracked_contracts = self.state.get_accepted_contracts()
+            inbox_contracts = list(self.state.current_contracts)
+            if not tracked_contracts and not inbox_contracts:
+                print("=== DEAD DROP // CONTRACT INBOX ===\n")
+                print("[sys] Inbox empty. No buyers are whispering right now.")
+                input("[Press Enter to return to the route mesh...]")
+                return
+
+            active_count = len(tracked_contracts)
             print("=== DEAD DROP // CONTRACT INBOX ===\n")
             print(
                 f"Subnet: {world.subnet_name}   Day: {self.state.day}   "
                 f"Wallet: {self.state.player_crypto} Crypto   Active: {active_count}\n"
             )
 
-            for idx, contract in enumerate(self.state.current_contracts, start=1):
+            menu_contracts = []
+            if tracked_contracts:
+                print("[TRACKING]")
+                for contract in tracked_contracts:
+                    menu_contracts.append(contract)
+                    idx = len(menu_contracts)
+                    print(
+                        f"[{idx}] TRACKING {contract['sender']} :: {contract['subject']}"
+                    )
+                    print(
+                        f"    target {contract['target_ip']} ({contract['target_node_type'].upper()}) | "
+                        f"payout {contract['reward']} Crypto"
+                    )
+                    print(f"    {contract['brief']}")
+                    print(f"    condition: {contract['condition_text']}\n")
+
+            if inbox_contracts:
+                print("[INBOX]")
+            for contract in inbox_contracts:
+                menu_contracts.append(contract)
+                idx = len(menu_contracts)
                 status = self.get_contract_status(contract)
                 print(
                     f"[{idx}] {status:<8} {contract['sender']} :: {contract['subject']}"
@@ -1300,12 +2206,12 @@ class TcodTerminalApp:
             if choice in {"0", "q", "exit", "back"}:
                 return
 
-            if not choice.isdigit() or not (1 <= int(choice) <= len(self.state.current_contracts)):
+            if not choice.isdigit() or not (1 <= int(choice) <= len(menu_contracts)):
                 print("[sys] Mail index invalid.")
                 time.sleep(0.7)
                 continue
 
-            contract = self.state.current_contracts[int(choice) - 1]
+            contract = menu_contracts[int(choice) - 1]
             self.clear_screen()
             print(f"[sys] Intercepted packet opened: ~/.mail/{contract['id'].replace(':', '_')}.msg\n")
             print(f"FROM:    {contract['sender']}")
@@ -1323,6 +2229,7 @@ class TcodTerminalApp:
             action = input(prompt + "\n> ").strip().lower()
             if action == "a" and status == "AVAILABLE":
                 self.state.accept_contract(contract["id"])
+                self.checkpoint_progress()
                 print(f"[sys] Contract accepted. Route marker pinned on {contract['target_ip']}.")
                 time.sleep(1.0)
 
@@ -1372,11 +2279,17 @@ class TcodTerminalApp:
         if not self.item_library:
             return "\n=== MAN PAGE: ITEMS ===\n> No consumable ledger loaded.\n\n"
 
+        visible_items = self.get_visible_item_ids()
         lines = [
             "\n=== MAN PAGE: ITEMS ===",
             "> Syntax: use <item> or use <item> -target <SUB>",
         ]
-        for item_id, data in sorted(self.item_library.items()):
+        if not visible_items:
+            lines.extend(["", "> No carried consumables on this rig."])
+            return "\n".join(lines) + "\n\n"
+
+        for item_id in visible_items:
+            data = self.item_library[item_id]
             amount = self.player.get_consumable_count(item_id) if self.player else 0
             lines.extend(
                 [
@@ -1440,14 +2353,44 @@ class TcodTerminalApp:
             "bot": "bots",
             "trace-level": "trace",
             "trace_level": "trace",
+            "heat": "trace",
+            "noise": "noise",
+            "bf": "noise",
+            "ex": "noise",
+            "brute-noise": "noise",
+            "brute_noise": "noise",
+            "exploit-noise": "noise",
+            "exploit_noise": "noise",
+            "hunter": "sweep",
+            "hunt": "sweep",
+            "sweeps": "sweep",
             "brute": "brute-force",
             "bruteforce": "brute-force",
             "brute_force": "brute-force",
+            "rooted": "root",
+            "bricked": "brick",
+            "phase": "phases",
+            "cleanup": "phases",
+            "contract": "contracts",
+            "contracts": "contracts",
+            "domain": "domains",
+            "domains": "domains",
+            "estate": "domains",
+            "bus": "buses",
+            "buses": "buses",
+            "backplane": "buses",
+            "backplanes": "buses",
+            "fabric": "buses",
+            "bus-fabric": "buses",
+            "bus_fabric": "buses",
         }
         return aliases.get(topic, topic)
 
     def build_topic_manual_text(self, target: str):
         topic = self.normalize_manual_topic(target)
+
+        if not self.is_manual_topic_visible(topic):
+            return None
 
         if topic in {"os", "sec", "net", "mem", "sto"}:
             return self.build_subsystem_manual_text(topic.upper())
@@ -1468,15 +2411,6 @@ class TcodTerminalApp:
                         "NET = scans, routing, disconnects, and recon quality.",
                         "MEM = RAM recovery plus effective max RAM.",
                         "STO = storage, caches, and loot value.",
-                    ],
-                ),
-                (
-                    "READ THEM LIKE THIS",
-                    [
-                        "If brute damage feels weak, check SEC.",
-                        "If your turn economy feels bad, check MEM.",
-                        "If recon is failing or disconnect is impossible, check NET.",
-                        "If you want side-profit, check STO.",
                     ],
                 ),
             ],
@@ -1524,13 +2458,85 @@ class TcodTerminalApp:
                         "utility = defense, repair, scrub, prediction, or control.",
                     ],
                 ),
+            ],
+            "phases": [
                 (
-                    "RULE OF THUMB",
+                    "TURN PHASES",
                     [
-                        "Scans stop guessing.",
-                        "Exploits open windows.",
-                        "Brute-force closes fights.",
-                        "Utility keeps you alive long enough to do the first three well.",
+                        "Recon = passive intel gathering before breach, plus scan-class payloads used during a live link.",
+                        "Execution = stack construction and queue commit.",
+                        "Cleanup = hostile response, forensic residue, RAM recovery, and route-state stabilization before the next turn.",
+                    ],
+                ),
+                (
+                    "CONTEXT-AWARE TOOLS",
+                    [
+                        "nmap, enum, whois, and dirb behave differently depending on whether you use them during passive recon or inside a live combat link.",
+                        "dry_run clones the current stack against a ghost copy of the target and never wakes the real hostile routine.",
+                    ],
+                ),
+            ],
+            "root": [
+                (
+                    "ROOT ACCESS",
+                    [
+                        "A clean core finish grants rooted control instead of wrecking the host.",
+                        "Rooted nodes keep their route value, yield recoverable loot, and store module slots for later systems.",
+                    ],
+                ),
+            ],
+            "brick": [
+                (
+                    "BRICKED NODE",
+                    [
+                        "A sloppy kill chain or destabilized core finish bricks the node.",
+                        "Bricked nodes still clear the route, but their data image is dead and no rewards are recovered.",
+                    ],
+                ),
+            ],
+            "dry_run": [
+                (
+                    "SANDBOX",
+                    [
+                        "dry_run clones the current hostile state and resolves the queued stack against that ghost copy.",
+                        "It prints predicted RAM flow, payload order, and the likely node outcome without triggering the real enemy AI.",
+                        "This feature is unlocked later in the run ladder and does not spend the turn when used from planning.",
+                    ],
+                ),
+            ],
+            "contracts": [
+                (
+                    "CONTRACT PIPELINE",
+                    [
+                        "mail opens newly issued offers for the current route mesh.",
+                        "Accepting a job moves it into the active contract ledger until you resolve or fail it.",
+                        "Tracked contracts appear in the objective tracker, node intel, and the contracts shell command.",
+                    ],
+                ),
+                (
+                    "SHELL ACCESS",
+                    [
+                        "Type mail to review offers in the dead drop.",
+                        "Type contracts to print tracked jobs plus any waiting offers.",
+                        "cat ~/proc/contracts prints the same ledger through the pseudo-filesystem.",
+                    ],
+                ),
+            ],
+            "domains": [
+                (
+                    "ROOTED NODES",
+                    [
+                        "A rooted node keeps one infrastructure slot until a later upgrade expands it.",
+                        "Bricked nodes keep zero slots and zero retained infrastructure value.",
+                        "Installing a module burns that one slot until the node is upgraded in a later system pass.",
+                    ],
+                ),
+                (
+                    "MODULE TYPES",
+                    [
+                        "vpn_tunnel = fast travel back into that rooted node shell.",
+                        "botnet_seed = permanent remote traffic that scales DDOS output globally.",
+                        "crypto_miner = passive Crypto yield when the route mesh rolls forward.",
                     ],
                 ),
             ],
@@ -1538,8 +2544,7 @@ class TcodTerminalApp:
                 (
                     "SCAN CLASS",
                     [
-                        "Scans do not win the race directly. They make your later turns accurate.",
-                        "Use scan tools when the target pane is vague, the weak point is unknown, or the hostile move is unreadable.",
+                        "They reveal topology, ownership, telemetry, or hostile intent depending on the tool.",
                         "Scans also matter before combat: the recon shell can reveal intel at the cost of exposure.",
                     ],
                 ),
@@ -1557,17 +2562,8 @@ class TcodTerminalApp:
                 (
                     "BRUTE-FORCE CLASS",
                     [
-                        "These are your kill scripts.",
                         "They are louder, more predictable, and easier for the host to adapt to if you spam them.",
-                        "Their job is to cash in the information and openings created by scans and exploits.",
-                    ],
-                ),
-                (
-                    "BEST USE",
-                    [
-                        "Hit the known weak subsystem.",
-                        "Finish a subsystem that is already softened up.",
-                        "Avoid mindless repetition if the host is adapting to your cadence.",
+                        "They convert access and timing windows into direct subsystem pressure.",
                     ],
                 ),
             ],
@@ -1575,16 +2571,9 @@ class TcodTerminalApp:
                 (
                     "EXPLOIT CLASS",
                     [
-                        "Exploit scripts are not always pure damage. Their real value is changing the board state.",
+                        "Exploit scripts are not always pure damage.",
                         "They can open SEC, pressure specific architectures, or set up stronger later hits.",
-                        "Run exploits when brute-force alone is being soaked, screened, or outpaced.",
-                    ],
-                ),
-                (
-                    "STACK WITH",
-                    [
-                        "Scans, because good exploits want accurate target info.",
-                        "Brute-force, because exploits often create the lane that lets heavy damage land cleanly.",
+                        "Many exploits care about services, endpoint hits, or exposed lanes rather than raw force alone.",
                     ],
                 ),
             ],
@@ -1592,18 +2581,8 @@ class TcodTerminalApp:
                 (
                     "UTILITY CLASS",
                     [
-                        "Utility scripts are your survival and control layer.",
                         "They usually do not race OS damage directly, but they stop the enemy from dictating the fight.",
-                        "Use them when you can predict the next hostile move or when you need to stabilize your own rig.",
-                    ],
-                ),
-                (
-                    "EXAMPLES",
-                    [
-                        "harden = absorb a predicted hit.",
-                        "honeypot = waste the next hostile scan.",
-                        "canary / sinkhole = punish the correct prediction.",
-                        "rekey / spoof = peel back enemy control or recon.",
+                        "This class includes hardening, deception, buffering, repair, and session control routines.",
                     ],
                 ),
             ],
@@ -1705,7 +2684,70 @@ class TcodTerminalApp:
                     "WHY IT MATTERS",
                     [
                         "Trace is a run-level pressure stat, not just a single-fight number.",
+                        "If trace climbs too far, the run gets hotter and riskier.",
                         "Fleeing under fire also spikes trace.",
+                    ],
+                ),
+            ],
+            "noise": [
+                (
+                    "NOISE LEDGER",
+                    [
+                        "Noise is the network's memory of how you have been operating across the run.",
+                        "The ledger is split into BF and EX.",
+                        "BF means brute-force noise. EX means exploit noise.",
+                    ],
+                ),
+                (
+                    "WHAT BF AND EX MEAN",
+                    [
+                        "BF climbs when you lean on loud direct pressure like brute-force payloads and noisy flags.",
+                        "EX climbs when you lean on exploit-style access abuse, injection, and similar exploit traffic.",
+                        "The higher bucket becomes your visible style profile for scaling, events, and some hostile adaptation.",
+                    ],
+                ),
+            ],
+            "sweep": [
+                (
+                    "SWEEP",
+                    [
+                        "Sweep is the current subnet's hunt pressure.",
+                        "It represents defenders, scanners, or hunter-net activity tightening around your local route mesh.",
+                        "It is local to the current subnet, while trace is global to the run.",
+                    ],
+                ),
+                (
+                    "WHY IT MATTERS",
+                    [
+                        "Higher sweep means hotter breaches and more route pressure while you stay in that subnet.",
+                        "You can think of it as the local timer pushing the mesh toward a worse security posture.",
+                    ],
+                ),
+            ],
+            "buses": [
+                (
+                    "WHAT BUSES ARE",
+                    [
+                        "Buses are the internal links between subsystems inside one host.",
+                        "They are shown as arrows or links because they are the paths traffic, state, and hardware fallout can travel through.",
+                        "A bus is not another subsystem to kill. It is the route between subsystems.",
+                    ],
+                ),
+                (
+                    "WHY YOU CARE",
+                    [
+                        "Splash and crash effects can travel across live buses.",
+                        "If you blow up one subsystem hard enough, nearby linked subsystems can get clipped too.",
+                        "That can help you spread pressure, or accidentally brick a fragile host if you get sloppy.",
+                    ],
+                ),
+                (
+                    "HOW TO READ THEM",
+                    [
+                        "SEC <-> NET usually means perimeter traffic and session handoff.",
+                        "OS <-> MEM means runtime and working-state pressure.",
+                        "OS <-> STO means filesystem or cache traffic.",
+                        "If a connected subsystem dies, that route can cut or cascade depending on the effect that hit it.",
                     ],
                 ),
             ],
@@ -1725,6 +2767,9 @@ class TcodTerminalApp:
                         "use <item> or use <item> -target <SUB> spends a consumable.",
                         "execute runs the queued turn.",
                         "clear wipes the current queue.",
+                        "wait or pass yields the turn without spending RAM.",
+                        "defend <SUB> grants a free short ACL shell on that subsystem.",
+                        "repair <SUB> spends the turn restoring a little integrity to your own rig.",
                         "disconnect attempts to flee the encounter.",
                     ],
                 ),
@@ -1756,68 +2801,54 @@ class TcodTerminalApp:
     def build_command_index_manual_text(self):
         installed_scripts = []
         installed_flags = []
-        known_scripts = []
-        known_flags = []
         if self.arsenal:
-            for script_id, data in self.arsenal.scripts.items():
+            for script_id in self.get_installed_script_ids():
+                data = self.arsenal.scripts[script_id]
                 label = f"{script_id} ({data.get('type', 'tool').replace('_', '-')}, {data.get('ram', 0)} RAM)"
-                known_scripts.append(label)
-                if not self.player or self.player.owns_script(script_id):
-                    installed_scripts.append(label)
-            for flag_id, data in self.arsenal.flags.items():
+                installed_scripts.append(label)
+            for flag_id in self.get_installed_flag_ids():
+                data = self.arsenal.flags[flag_id]
                 label = f"{flag_id} (+{data.get('ram', 0)} RAM)"
-                known_flags.append(label)
-                if not self.player or self.player.owns_flag(flag_id):
-                    installed_flags.append(label)
+                installed_flags.append(label)
+
+        shell_helpers = [
+            "pwd, ls, cat, history, whoami, hostname, uname, date, clear, cls, reset-terminal, dev.",
+            "These do not spend RAM and are meant to make the terminal feel like a real machine.",
+        ]
+        if self.state and self.state.has_meta("dry_run"):
+            shell_helpers.insert(0, "dry_run = resolve the queued stack against a ghost copy of the current host.")
 
         return self.format_manual_page(
             "commands",
             [
-                ("WHAT THIS IS", "Index of payloads, modifiers, and local shell helpers. Type man <name> for a full page on any one of them."),
+                ("WHAT THIS IS", "Index of payloads, modifiers, and local shell helpers currently exposed on this rig."),
                 ("INSTALLED SCRIPTS", installed_scripts or ["none installed"]),
                 ("INSTALLED FLAGS", installed_flags or ["none installed"]),
-                (
-                    "LOCAL SHELL HELPERS",
-                    [
-                        "pwd, ls, cat, history, whoami, hostname, uname, date, clear, cls, reset-terminal.",
-                        "These do not spend RAM and are meant to make the dev terminal feel like a real machine.",
-                    ],
-                ),
-                (
-                    "FULL ARSENAL KNOWN TO THIS BUILD",
-                    [
-                        f"{len(known_scripts)} scripts defined.",
-                        f"{len(known_flags)} flags defined.",
-                        "Even if a payload is not installed on your current rig, man <name> will still explain it.",
-                    ],
-                ),
+                ("LOCAL SHELL HELPERS", shell_helpers),
             ],
         )
 
     def build_flag_index_manual_text(self):
         installed_flags = []
-        hidden_count = 0
         if self.arsenal:
-            for flag_id, data in self.arsenal.flags.items():
-                if self.player and not self.player.owns_flag(flag_id):
-                    hidden_count += 1
-                    continue
+            for flag_id in self.get_installed_flag_ids():
+                data = self.arsenal.flags[flag_id]
                 installed_flags.append(f"{flag_id} = {data.get('description', 'No data.')}")
 
-        sections = [
-            (
-                "FLAG BASICS",
-                [
-                    "Flags are modifiers added to scripts in the same command line.",
-                    "They stack if the script supports them and your current rig owns them.",
-                    "Queue execution prints each stacked flag separately so you can see what changed.",
-                ],
-            ),
-            ("INSTALLED FLAGS", installed_flags or ["none installed"]),
-        ]
-        if hidden_count:
-            sections.append(("HIDDEN FLAGS", [f"{hidden_count} flag(s) exist in the wider arsenal but are not installed on this rig."]))
-        return self.format_manual_page("flags", sections)
+        return self.format_manual_page(
+            "flags",
+            [
+                (
+                    "FLAG BASICS",
+                    [
+                        "Flags are modifiers added to scripts in the same command line.",
+                        "They only work if the script supports them and this rig actually owns them.",
+                        "Queue execution prints stacked modifiers one by one during commit.",
+                    ],
+                ),
+                ("INSTALLED FLAGS", installed_flags or ["none installed"]),
+            ],
+        )
 
     def build_subsystem_manual_text(self, subsystem_id: str):
         subsystem_id = subsystem_id.upper()
@@ -1865,13 +2896,19 @@ class TcodTerminalApp:
 
         if target in self.arsenal.scripts:
             installed = not self.player or self.player.owns_script(target)
+            if not installed:
+                return None
             return self.build_script_manual_text(target, self.arsenal.scripts[target], installed=installed)
 
         if target in self.arsenal.flags:
             installed = not self.player or self.player.owns_flag(target)
+            if not installed:
+                return None
             return self.build_flag_manual_text(target, self.arsenal.flags[target], installed=installed)
 
         if target in self.item_library:
+            if self.player and self.player.get_consumable_count(target) <= 0:
+                return None
             data = self.item_library[target]
             return self.build_item_entry_manual_text(target, data)
 
@@ -1899,6 +2936,7 @@ class TcodTerminalApp:
             ),
             ("SYNOPSIS", [synopsis]),
             ("DESCRIPTION", [data.get("description", "No data.")]),
+            ("PHASE BEHAVIOR", self.describe_script_phase_behavior(script_id, data)),
             ("TARGETING", self.describe_script_targeting(script_id, data)),
             ("EFFECTS", self.describe_script_manual_effects(script_id, data)),
         ]
@@ -1936,6 +2974,27 @@ class TcodTerminalApp:
         return [
             "This payload accepts -target <OS|SEC|NET|MEM|STO>.",
             "If you omit -target, the command keeps its current generic routing behavior and may rely on its own internal defaults.",
+        ]
+
+    @staticmethod
+    def describe_script_phase_behavior(script_id: str, data: dict):
+        script_type = str(data.get("type", "tool"))
+        if script_type == "scan":
+            return [
+                "During passive recon, this stays in the recon phase and raises exposure instead of waking the full hostile combat loop.",
+                "During a live encounter, it resolves inside the execution stack and can set up adjacency-sensitive follow-through.",
+            ]
+        if script_id in {"stager", "buffer", "jmp"}:
+            return [
+                "This is an execution-phase stack-control tool.",
+                "It does not damage the host directly; it changes how the immediate nearby payloads resolve.",
+            ]
+        if script_type == "utility":
+            return [
+                "Utility payloads resolve in the execution phase and usually change board state rather than raw damage.",
+            ]
+        return [
+            "This payload resolves in the execution phase during a live hostile link.",
         ]
 
     def build_flag_manual_text(self, flag_id: str, data: dict, *, installed: bool = True):
@@ -1984,12 +3043,19 @@ class TcodTerminalApp:
         return card.title, card.body, card.tone, card.command, card.detail
 
     def get_manual_entry(self, target: str):
+        topic = self.normalize_manual_topic(target)
+        if not self.is_manual_topic_visible(topic):
+            return None
         manuals = {
             "os": "OS is the core execution plane. If it reaches zero, that side loses. Direct OS pressure is inefficient while SEC is still intercepting traffic.",
             "sec": "SEC is the perimeter and access-control layer. It catches most direct OS pressure and often has to be peeled back before deeper fingerprinting works.",
             "net": "NET is the routing and scan plane. It governs recon quality, trace routines, and whether you can still disconnect cleanly.",
             "mem": "MEM is the runtime state and allocator pool. It controls RAM recovery per turn and every 4 missing MEM HP also cuts 1 effective max RAM.",
             "sto": "STO is storage, archives, and cached value. It often holds crypto, loot, exports, and other side rewards without being the primary kill target.",
+            "trace": "Trace is your run-wide heat. It rises when you are loud, sloppy, or forced to cut out under pressure, and it makes the whole run more dangerous.",
+            "noise": "Noise is the style ledger. BF means brute-force noise and EX means exploit noise. Those buckets tell the world what kind of operator you have been acting like.",
+            "sweep": "Sweep is local hunt pressure inside the current subnet. It is the local search net tightening around your current route mesh.",
+            "buses": "Buses are the internal links between subsystems inside one host. They matter because splash and cascade effects can travel along them.",
             "classes": "Scripts fall into four operational groups: scan collects telemetry, exploit abuses an exposed surface, brute-force applies loud direct pressure, and utility manages defense or board control.",
             "scan": "Scan scripts collect topology, services, ownership data, or process telemetry. They are how you turn an unknown host into a readable target.",
             "brute": "Brute-force scripts are noisy direct pressure. They force access paths or pound exposed lanes once the host surface is known.",
@@ -1998,7 +3064,7 @@ class TcodTerminalApp:
             "bruteforce": "Brute-force scripts are noisy direct pressure. They force access paths or pound exposed lanes once the host surface is known.",
             "utility": "Utility scripts handle defense, repair, deception, and control-plane disruption instead of raw damage.",
         }
-        return manuals.get(target)
+        return manuals.get(topic)
 
     def build_black_ice_objective(self, enemy):
         card = build_black_ice_tutorial_card(enemy)
@@ -2115,17 +3181,47 @@ class TcodTerminalApp:
         return response
 
     def save_progress(self):
-        print("\n[sys] Writing state to encrypted local storage (save_data.pkl)...")
+        print("\n[sys] Writing autosave checkpoint to local storage...")
         time.sleep(0.5)
         try:
-            GameState.save_session(self.state, self.player)
-            print("[sys] Session saved successfully.")
+            self.checkpoint_progress()
+            print("[sys] Autosave checkpoint updated.")
             time.sleep(1)
             return True
         except Exception as exc:
             print(f"[sys] Critical Error: Save failed. {exc}")
             time.sleep(1)
             return False
+
+    def write_named_save(self, slot_key: str, display_name: str | None = None):
+        if not self.state or not self.player:
+            raise ValueError("No live session state to save.")
+        with self.io_lock:
+            self.state.ensure_runtime_defaults()
+            if hasattr(self.player, "ensure_runtime_defaults"):
+                self.player.ensure_runtime_defaults()
+            GameState.save_session(
+                self.state,
+                self.player,
+                slot_key=slot_key,
+                display_name=display_name,
+            )
+            self.active_save_reference = slot_key
+        return True
+
+    def checkpoint_progress(self):
+        if not self.state or not self.player:
+            return False
+        self.state.ensure_runtime_defaults()
+        if hasattr(self.player, "ensure_runtime_defaults"):
+            self.player.ensure_runtime_defaults()
+        GameState.save_session(
+            self.state,
+            self.player,
+            slot_key=GameState.AUTOSAVE_SLOT_KEY,
+            display_name="autosave",
+        )
+        return True
 
     def shutdown_game(self):
         print("\nShutting down Terminal Rogue...")
@@ -2140,11 +3236,22 @@ class TcodTerminalApp:
         self.dev_console_requested = False
         return requested
 
+    def request_return_to_main_menu(self):
+        if self.state and self.player and not getattr(self.state, "game_over", False):
+            try:
+                self.checkpoint_progress()
+            except Exception:
+                pass
+        self.return_to_menu_requested = True
+        if self.active_prompt:
+            self.input_queue.put("")
+
     def reset_frontend_state(self):
         self.state = None
         self.player = None
         self.arsenal = None
         self.current_enemy = None
+        self.active_tap_node_index = None
         self.active_prompt = ""
         self.current_input = ""
         self.stdout_buffer = ""
@@ -2154,6 +3261,9 @@ class TcodTerminalApp:
         self.map_cleared = set()
         self.map_active = None
         self.map_status = "Awaiting active subnet."
+        self.map_network = None
+        self.map_subnet_id = None
+        self.map_domain_id = None
         self.route_sweep_level = 0
         self.route_sweep_max = 0
         self.command_history = []
@@ -2165,11 +3275,19 @@ class TcodTerminalApp:
         self.objective_detail = initial_objective.detail
         self.objective_is_tutorial = initial_objective.tutorial
         self.combat_engine = None
+        self.return_to_menu_requested = False
+        self.selected_save_reference = None
+        self.active_save_reference = None
+
+    def purge_live_save_archives(self):
+        GameState.delete_session(slot_key=GameState.AUTOSAVE_SLOT_KEY)
+        if self.active_save_reference and self.active_save_reference != GameState.AUTOSAVE_SLOT_KEY:
+            GameState.delete_session(slot_key=self.active_save_reference)
 
     def handle_permadeath(self):
         final_day = self.state.day if self.state else 1
         final_crypto = self.state.player_crypto if self.state else 0
-        GameState.delete_session()
+        self.purge_live_save_archives()
         self.clear_screen()
         self.apply_objective_card(run_burned_card())
         print("\n" + "#" * 58)
@@ -2199,7 +3317,7 @@ class TcodTerminalApp:
         input(continue_prompt)
 
     def collapse_from_prologue(self, combat):
-        GameState.delete_session()
+        GameState.delete_session(slot_key=GameState.AUTOSAVE_SLOT_KEY)
         self.state.threat_ledger = ThreatLedger()
         self.state.player_crypto = 0
         self.state.trace_level = 0
@@ -2211,6 +3329,19 @@ class TcodTerminalApp:
         combat.player = self.player
 
     def run_tutorial_sequence(self, combat, enemies_data, ability_library):
+        if not self.state.lore_intro_complete:
+            self.state.lore_intro_complete = True
+            if not hasattr(self, "boot_menu"):
+                self.show_message_log(
+                    "orientation.txt",
+                    lab_orientation_message(),
+                    "[Press Enter to continue...]",
+                )
+                self.show_message_log(
+                    "lab_rules.txt",
+                    sandbox_rules_message(),
+                    "[Press Enter to bring the workstation online...]",
+                )
         self.apply_objective_card(tutorial_bootstrap_card())
         self.clear_screen()
         input("[Press Enter to run the warm-up node...]")
@@ -2295,7 +3426,20 @@ class TcodTerminalApp:
         if cached_enemy is not None:
             if hasattr(cached_enemy, "ensure_runtime_defaults"):
                 cached_enemy.ensure_runtime_defaults()
+            self.apply_pending_node_damage(node, cached_enemy)
+            if cached_enemy.subsystems["OS"].current_hp <= 0:
+                node.compromise_state = "bricked"
+                node.locked_data = True
+                node.root_access = False
+                node.module_slots = 0
+                node.forensic_complete = False
             return cached_enemy
+
+        pressure = self.state.get_difficulty_pressure() if self.state and hasattr(self.state, "get_difficulty_pressure") else 1
+        progression_tier = self.state.get_progression_tier() if self.state and hasattr(self.state, "get_progression_tier") else 0
+        low_pressure = pressure <= 2 and progression_tier <= 1
+        rng_seed = getattr(node, "spawn_seed", 0) or (self.state.make_seed("enemy", node.ip_address, node.node_type, node.difficulty) if self.state and hasattr(self.state, "make_seed") else f"{node.ip_address}:{node.node_type}:{node.difficulty}")
+        rng = random.Random(rng_seed)
 
         template_map = {
             "civilian": (
@@ -2324,6 +3468,21 @@ class TcodTerminalApp:
                 [None, "hardened", "corrupted", "monitored"],
                 1,
             ),
+            "lab": (
+                ["research_cluster", "sandbox_array", "backup_tape_library"],
+                [None, "hardened", "monitored"],
+                2,
+            ),
+            "relay": (
+                ["mail_spool", "relay_exchange", "campus_vpn"],
+                [None, "legacy", "monitored", "backdoored"],
+                1,
+            ),
+            "media": (
+                ["streamer_rig", "cdn_edge", "smart_tv_wall"],
+                [None, "backdoored", "corrupted"],
+                1,
+            ),
             "honeypot": (
                 ["omnicorp_gateway", "watcher_ipcam", "research_cluster", "campus_vpn"],
                 ["monitored", "air_gapped", "hardened", "corrupted"],
@@ -2335,7 +3494,7 @@ class TcodTerminalApp:
                 2,
             ),
         }
-        if self.state and self.state.day == 1:
+        if low_pressure:
             template_map["personal"] = (
                 ["grandma_pc", "sleepy_laptop"],
                 [None],
@@ -2358,12 +3517,15 @@ class TcodTerminalApp:
             "iot": ["proxy_splitter", "lens_burn", "trace_route", "defense_breach", "packet_storm", "dns_maze"],
             "server": ["memory_spike", "patch_cycle", "trace_route", "ram_lock", "data_reaper", "defense_breach", "cache_patch", "tls_needle"],
             "corporate": ["memory_spike", "patch_cycle", "trace_route", "ram_lock", "data_reaper", "lens_burn", "defense_breach", "kernel_jab", "dns_maze", "tls_needle"],
+            "lab": ["heap_shred", "memory_spike", "cache_patch", "ram_lock", "tls_needle"],
+            "relay": ["dns_maze", "trace_route", "packet_storm", "proxy_splitter", "tls_needle"],
+            "media": ["packet_storm", "dns_maze", "trace_route", "chunk_overflow"],
             "honeypot": ["trace_route", "ram_lock", "data_reaper", "patch_cycle", "proxy_splitter", "lens_burn", "defense_breach", "dns_maze"],
             "gatekeeper": ["trace_route", "ram_lock", "data_reaper", "patch_cycle", "proxy_splitter", "lens_burn", "memory_spike", "defense_breach", "kernel_jab", "dns_maze", "tls_needle"],
         }
 
         template_pool, modifier_pool, bonus_cap = template_map.get(node.node_type, (["grandma_pc"], [None], 1))
-        template_key = random.choice(template_pool)
+        template_key = rng.choice(template_pool)
         enemy_template = dict(enemies_data.get(template_key, {}))
         difficulty_delta = max(0, node.difficulty - 1)
         scale_map = {
@@ -2373,13 +3535,19 @@ class TcodTerminalApp:
             "iot": (1, 1),
             "server": (2, 1),
             "corporate": (2, 1),
+            "lab": (2, 1),
+            "relay": (1, 1),
+            "media": (1, 1),
             "honeypot": (2, 1),
             "gatekeeper": (2, 1),
         }
         os_scale, budget_scale = scale_map.get(node.node_type, (2, 1))
-        if self.state and self.state.day == 1:
+        if low_pressure:
             os_scale = min(os_scale, 1)
             budget_scale = 0
+        if getattr(node, "lockdown_turns", 0) > 0:
+            enemy_template["base_os"] = enemy_template.get("base_os", 10) + max(1, node.lockdown_turns)
+            enemy_template["budget"] = enemy_template.get("budget", 0) + node.lockdown_turns
         enemy_template["base_os"] = enemy_template.get("base_os", 10) + (difficulty_delta * os_scale)
         enemy_template["budget"] = enemy_template.get("budget", 0) + (difficulty_delta * budget_scale)
         base_name = enemy_template.get("name", "Unknown Node")
@@ -2388,30 +3556,46 @@ class TcodTerminalApp:
         else:
             enemy_template["name"] = f"{base_name} [{node.ip_address}]"
 
-        modifier_key = random.choice(modifier_pool) if modifier_pool else None
-        if self.state and self.state.day == 1:
+        modifier_key = rng.choice(modifier_pool) if modifier_pool else None
+        if low_pressure:
             modifier_key = None
-        if node.node_type == "gatekeeper" and modifier_key is None and not (self.state and self.state.day == 1):
+        if getattr(node, "lockdown_turns", 0) > 0 and "monitored" in modifier_pool:
+            modifier_key = "monitored"
+        if node.node_type == "gatekeeper" and modifier_key is None and not low_pressure:
             non_null_modifiers = [item for item in modifier_pool if item]
             if non_null_modifiers:
-                modifier_key = random.choice(non_null_modifiers)
+                modifier_key = rng.choice(non_null_modifiers)
         modifier_data = modifiers.get(modifier_key) if modifier_key else None
 
         ability_list = list(enemy_template.get("abilities", []))
         bonus_pool = [ability for ability in bonus_ability_map.get(node.node_type, []) if ability not in ability_list]
         if bonus_pool:
-            if node.node_type == "gatekeeper":
-                bonus_count = min(len(bonus_pool), random.randint(1, bonus_cap))
+            if bonus_cap <= 0:
+                bonus_count = 0
+            elif node.node_type == "gatekeeper":
+                bonus_count = min(len(bonus_pool), rng.randint(1, bonus_cap))
             else:
-                bonus_count = min(len(bonus_pool), random.randint(0, bonus_cap))
-            if self.state and self.state.day == 1:
+                bonus_count = min(len(bonus_pool), rng.randint(0, bonus_cap))
+            if low_pressure:
                 bonus_count = 0
             if bonus_count > 0:
-                ability_list.extend(random.sample(bonus_pool, bonus_count))
+                ability_list.extend(rng.sample(bonus_pool, bonus_count))
         enemy_template["abilities"] = ability_list
 
         enemy_id = f"{node.node_type}_{node.ip_address.replace('.', '_')}"
-        node.cached_enemy = Enemy(enemy_id, enemy_template, self.state.threat_ledger, modifier_data, ability_library)
+        random_state = random.getstate()
+        random.seed(rng_seed)
+        try:
+            node.cached_enemy = Enemy(enemy_id, enemy_template, self.state.threat_ledger, modifier_data, ability_library)
+        finally:
+            random.setstate(random_state)
+        self.apply_pending_node_damage(node, node.cached_enemy)
+        if node.cached_enemy.subsystems["OS"].current_hp <= 0:
+            node.compromise_state = "bricked"
+            node.locked_data = True
+            node.root_access = False
+            node.module_slots = 0
+            node.forensic_complete = False
         if self.route_sweep_level > 1 and node.node_type != "gatekeeper":
             ambient_exposure = min(65, (self.route_sweep_level - 1) * 12)
             node.cached_enemy.apply_recon_exposure(ambient_exposure)
@@ -2428,13 +3612,31 @@ class TcodTerminalApp:
 
     def get_node_status_text(self, node_index, node, cleared_nodes):
         if node_index in cleared_nodes:
+            if getattr(node, "revolt_state", None) and getattr(node, "root_access", False):
+                return "CONTESTED"
+            if getattr(node, "compromise_state", "") == "rooted":
+                return "ROOTED"
+            if getattr(node, "compromise_state", "") == "bricked":
+                if not getattr(node, "forensic_complete", False):
+                    return "FORENSIC"
+                return "BRICKED"
             return "CLEARED"
-        if self.map_world and not self.map_world.can_route_to(node_index, cleared_nodes):
-            return "LOCKED"
+        if self.map_world:
+            anchor_index = self.map_active
+            if anchor_index is None and self.map_world.entry_links:
+                anchor_index = min(self.map_world.entry_links)
+            if not self.map_world.can_traverse_from(anchor_index, node_index, cleared_nodes):
+                return "LOCKED"
         if node.node_type == "shop":
             return "MARKET"
         if node.node_type == "gatekeeper":
-            return "FINAL"
+            return "BORDER"
+        if getattr(node, "compromise_state", "") == "bricked":
+            return "FORENSIC" if not getattr(node, "forensic_complete", False) else "BRICKED"
+        if getattr(node, "worm_level", 0) > 0:
+            return "INFECTED"
+        if getattr(node, "lockdown_turns", 0) > 0:
+            return "LOCKDOWN"
 
         enemy = getattr(node, "cached_enemy", None)
         if not enemy or not enemy.topology_revealed:
@@ -2451,9 +3653,41 @@ class TcodTerminalApp:
         enemy = getattr(node, "cached_enemy", None)
         contract_summary = self.build_contract_node_summary(node.ip_address, accepted_only=True)
         if not enemy:
+            revolt_state = getattr(node, "revolt_state", None)
+            if getattr(node, "compromise_state", "") == "rooted":
+                base = "intel: root access retained"
+                if getattr(node, "installed_module", None):
+                    base += f" // {node.installed_module}"
+                if revolt_state:
+                    base += f" // contested by {revolt_state.get('faction', 'reclaimers')}"
+                return f"{base} | {contract_summary}" if contract_summary else base
+            if getattr(node, "compromise_state", "") == "bricked":
+                base = "intel: forensic image open" if not getattr(node, "forensic_complete", False) else "intel: node bricked // data locked"
+                return f"{base} | {contract_summary}" if contract_summary else base
+            if getattr(node, "worm_level", 0) > 0:
+                base = f"intel: worm pressure {node.worm_level}"
+                return f"{base} | {contract_summary}" if contract_summary else base
+            if getattr(node, "lockdown_turns", 0) > 0:
+                base = f"intel: fresh route hardening // {node.lockdown_turns} step(s)"
+                return f"{base} | {contract_summary}" if contract_summary else base
             return contract_summary
 
         bits = []
+        revolt_state = getattr(node, "revolt_state", None)
+        if getattr(node, "compromise_state", "") == "rooted":
+            bits.append("root access retained")
+            if getattr(node, "installed_module", None):
+                bits.append(f"module {node.installed_module}")
+            if revolt_state:
+                bits.append(f"contested by {revolt_state.get('faction', 'reclaimers')}")
+            if getattr(node, "worm_level", 0) > 0:
+                bits.append(f"worm pressure {node.worm_level}")
+        elif getattr(node, "compromise_state", "") == "bricked":
+            bits.append("forensic image open" if not getattr(node, "forensic_complete", False) else "data image bricked")
+        elif getattr(node, "worm_level", 0) > 0:
+            bits.append(f"worm pressure {node.worm_level}")
+        if getattr(node, "lockdown_turns", 0) > 0:
+            bits.append(f"route hardening {node.lockdown_turns}")
         if enemy.identity_revealed:
             bits.append(enemy.get_visible_name().split("[")[0].strip())
         elif enemy.topology_revealed:
@@ -2490,8 +3724,269 @@ class TcodTerminalApp:
 
         return "intel: " + " | ".join(bits[:4])
 
-    def reward_node_clear(self, node, events_data):
+    def build_subnet_registry_lines(self, network, current_subnet_id):
+        if not network:
+            return ["[sys] No macro route mesh is loaded."]
+        lines = [f"=== ROUTE REGISTRY // {network.name} ===", ""]
+        for domain in network.domains.values():
+            lines.append(f"[{domain.domain_id}] {domain.name}")
+            lines.append(f"  {'ID':<6}{'SUBNET':<22}{'STATE':<12}{'LINKS'}")
+            for subnet_id in domain.subnet_ids:
+                subnet = network.get_subnet(subnet_id)
+                if not subnet:
+                    continue
+                status = "CONQUERED" if subnet.is_conquered() else "ACTIVE"
+                if subnet_id == current_subnet_id:
+                    status = "CURRENT"
+                neighbor_preview = ", ".join(sorted(subnet.neighbors)) or "none"
+                lines.append(
+                    f"  {subnet.subnet_id:<6}{subnet.subnet_name:<22}{status:<12}{neighbor_preview}"
+                )
+            lines.append("")
+        return lines[:-1] if lines and not lines[-1] else lines
+
+    def build_route_status_text(self, subnet):
+        domain = None
+        if self.map_network:
+            domain = self.map_network.get_domain(subnet.domain_id)
+        domain_label = domain.name if domain else subnet.domain_id
+        return (
+            f"{domain_label} | {subnet.subnet_id} | {subnet.subnet_name} | "
+            f"sweep {subnet.sweep_level}/{subnet.sweep_max} | "
+            f"foothold {subnet.world_map.nodes[subnet.current_anchor].ip_address}"
+        )
+
+    def sync_active_subnet_view(self, network, subnet):
+        self.route_sweep_level = subnet.sweep_level
+        self.route_sweep_max = subnet.sweep_max
+        self.state.current_subnet_id = subnet.subnet_id
+        self.state.current_domain_id = subnet.domain_id
+        self.map_network = network
+        self.set_network_world(
+            subnet.world_map,
+            subnet.cleared_nodes,
+            subnet.current_anchor,
+            status_text=self.build_route_status_text(subnet),
+            network=network,
+            subnet_id=subnet.subnet_id,
+            domain_id=subnet.domain_id,
+        )
+
+    @staticmethod
+    def subnet_is_locked_for_standard_travel(subnet):
+        return not subnet.is_conquered()
+
+    def apply_supercruise_penalty(self, network, current_subnet_id, target_subnet_id):
+        path = network.shortest_path(current_subnet_id, target_subnet_id)
+        if not path:
+            return False, ["[sys] Supercruise failed. No route solution exists for that target."]
+
+        current_subnet = network.get_subnet(current_subnet_id)
+        target_subnet = network.get_subnet(target_subnet_id)
+        distance = max(0, len(path) - 1)
+        domain_cross = 1 if current_subnet.domain_id != target_subnet.domain_id else 0
+        unconquered_crossings = sum(
+            1
+            for subnet_id in path[1:-1]
+            if not network.is_subnet_conquered(subnet_id)
+        )
+        risk_score = distance + (domain_cross * 3) + (unconquered_crossings * 2)
+        messages = [
+            f"[SUPERCRUISE] path {current_subnet_id} -> {target_subnet_id} // hops {distance} // risk {risk_score}"
+        ]
+
+        trace_gain = 4 + (distance * 3) + (domain_cross * 8) + (unconquered_crossings * 4)
+        self.state.trace_level += trace_gain
+        messages.append(f"[SUPERCRUISE] Trace spiked by +{trace_gain}.")
+
+        os_damage = 1 + distance + (domain_cross * 3) + unconquered_crossings
+        os_core = self.player.subsystems["OS"]
+        lost = min(os_core.current_hp, os_damage)
+        os_core.current_hp = max(0, os_core.current_hp - lost)
+        messages.append(f"[SUPERCRUISE] Tunnel turbulence shaved {lost} Core OS.")
+        if os_core.current_hp <= 0:
+            self.state.game_over = True
+            messages.append("[SUPERCRUISE] Core process image collapsed during transit.")
+            return False, messages
+
+        ram_loss = min(self.player.current_ram, max(1, distance + domain_cross + unconquered_crossings))
+        self.player.current_ram -= ram_loss
+        messages.append(f"[SUPERCRUISE] Buffer desync dumped {ram_loss} RAM.")
+
+        target_subnet.sweep_level = min(target_subnet.sweep_max, max(target_subnet.sweep_level, 1 + risk_score))
+        target_subnet.supercruise_heat = max(target_subnet.supercruise_heat, risk_score)
+
+        if risk_score >= 7 and random.random() < 0.3:
+            self.state.trace_level += 6
+            messages.append("[SUPERCRUISE] Border watchdog clipped the jump. You stayed in the current subnet.")
+            return False, messages
+
+        messages.append(f"[SUPERCRUISE] Jump solution held. Routed into {target_subnet.subnet_name}.")
+        return True, messages
+
+    @staticmethod
+    def get_dynamic_event_config(events_data):
+        return dict(events_data.get("dynamic_events", {})) if events_data else {}
+
+    def advance_world_dynamics(self, network, events_data):
+        if not network:
+            return []
+        return advance_dynamic_events(
+            network,
+            self.state,
+            self.get_dynamic_event_config(events_data),
+            current_subnet_id=self.state.current_subnet_id,
+        )
+
+    @staticmethod
+    def apply_pending_node_damage(node, enemy):
+        pending = dict(getattr(node, "pending_subsystem_damage", {}) or {})
+        if not pending:
+            return
+        if hasattr(enemy, "ensure_runtime_defaults"):
+            enemy.ensure_runtime_defaults()
+        for subsystem_key, amount in pending.items():
+            if amount <= 0 or subsystem_key not in enemy.subsystems:
+                continue
+            dealt = enemy.subsystems[subsystem_key].take_damage(amount)
+            if dealt > 0 and enemy.subsystems[subsystem_key].is_destroyed and subsystem_key != "OS":
+                enemy.subsystems["OS"].take_damage(2)
+        node.pending_subsystem_damage = {}
+
+    def build_revolt_enemy_for_node(self, node, enemies_data, ability_library):
+        revolt_state = getattr(node, "revolt_state", None) or {}
+        faction = revolt_state.get("faction", "antivirus")
+        template_key = "white_hat_reclaimer" if faction == "white_hat" else "antivirus_reclaimer"
+        enemy_template = dict(enemies_data.get(template_key, enemies_data.get("budget_rack", {})))
+        strength = max(1, int(revolt_state.get("strength", node.difficulty + 1)))
+        enemy_template["base_os"] = enemy_template.get("base_os", 12) + strength
+        enemy_template["budget"] = enemy_template.get("budget", 8) + max(1, strength // 2)
+        enemy_template["name"] = f"{enemy_template.get('name', 'Route Reclaimer')} [{node.ip_address}]"
+        enemy = Enemy(
+            f"revolt_{node.ip_address.replace('.', '_')}",
+            enemy_template,
+            self.state.threat_ledger,
+            ability_library=ability_library,
+        )
+        enemy.reveal_surface()
+        return enemy
+
+    def defend_rooted_node(self, node, node_index, current_subnet, world, combat, enemies_data, ability_library, events_data):
+        revolt_state = getattr(node, "revolt_state", None)
+        if not revolt_state:
+            self.manage_rooted_node(node, world, events_data)
+            return
+
+        faction = revolt_state.get("faction", "antivirus")
+        self.clear_screen()
+        print(f"[sys] Rooted shell at {node.ip_address} is under active challenge.")
+        print(f"[sys] Incoming claimant: {faction}.")
+        input("[Press Enter to jack into the defense feed...]")
+
+        enemy = self.build_revolt_enemy_for_node(node, enemies_data, ability_library)
+        self.current_enemy = enemy
+        result = combat.start_encounter(enemy)
+        self.current_enemy = None
+
+        if self.state.game_over:
+            return
+
+        if result.outcome == "fled":
+            print("[sys] You cut the defense feed. The contest on that node is still live.")
+            input("[Press Enter to return to the route mesh...]")
+            return
+
+        if enemy.subsystems["OS"].current_hp > 0:
+            print("[sys] The reclaiming traffic is still live on that node.")
+            input("[Press Enter to return to the route mesh...]")
+            return
+
+        if result.reason == "bricked":
+            mark_node_bricked(node, current_subnet, node_index, self.state, "defense")
+            print("[sys] You held the line, but the rooted node was bricked in the crossfire.")
+            input("[Press Enter to return to the route mesh...]")
+            return
+
+        node.revolt_state = None
+        node.compromise_state = "rooted"
+        node.root_access = True
+        node.locked_data = False
+        node.module_slots = max(1, getattr(node, "module_slots", 1))
+        self.state.claim_rooted_node(node)
+        print("[sys] Reclaimer traffic cleared. Root access retained.")
+        input("[Press Enter to reopen the rooted shell...]")
+        self.manage_rooted_node(node, world, events_data)
+
+    def investigate_forensic_node(
+        self,
+        node,
+        node_index,
+        current_subnet,
+        enemies_data,
+        modifiers,
+        ability_library,
+        events_data,
+    ):
+        config = self.get_dynamic_event_config(events_data)
+        self.clear_screen()
+        print("=== FORENSIC NODE IMAGE ===\n")
+        print(f"Target: {node.ip_address} ({node.node_type.upper()})")
+        print("Status: destroyed hardware // no live hostile process remains\n")
+
+        enemy = getattr(node, "cached_enemy", None)
+        if enemy is not None and hasattr(enemy, "ensure_runtime_defaults"):
+            enemy.ensure_runtime_defaults()
+            enemy.reveal_surface()
+            enemy.reveal_telemetry()
+            print(f"Recovered chassis: {enemy.get_visible_name()}")
+            print(f"Last visible countermeasure: {enemy.get_visible_weapon()}")
+            print("Bus fabric:")
+            for line in enemy.get_bus_report_lines()[:5]:
+                print(line)
+            print("")
+
+        if not getattr(node, "forensic_complete", False):
+            scrap_min = int(config.get("forensic_scrap_min", 10))
+            scrap_max = int(config.get("forensic_scrap_max", 26))
+            reward = random.randint(scrap_min, max(scrap_min, scrap_max))
+            self.state.player_crypto += reward
+            print(f"[FORENSICS] Pulled {reward} Crypto in salvageable residue.")
+
+            reveal_cap = int(config.get("forensic_neighbor_reveal", 2))
+            neighbors = list(current_subnet.world_map.links.get(node_index, set()))
+            random.shuffle(neighbors)
+            revealed = []
+            for neighbor_index in neighbors[:reveal_cap]:
+                neighbor = current_subnet.world_map.nodes[neighbor_index]
+                if neighbor.node_type == "shop":
+                    continue
+                neighbor_enemy = self.build_enemy_for_node(neighbor, enemies_data, modifiers, ability_library)
+                neighbor_enemy.reveal_surface()
+                revealed.append(f"{neighbor.ip_address} -> {neighbor_enemy.get_visible_name()}")
+            if revealed:
+                print("[FORENSICS] Route scraps leaked neighboring identities:")
+                for line in revealed:
+                    print(f" - {line}")
+
+            module_library = events_data.get("modules", {})
+            salvage_chance = float(config.get("forensic_module_salvage_chance", 0.18))
+            if module_library and random.random() < salvage_chance:
+                module_id = random.choice(list(module_library.keys()))
+                self.state.grant_module_inventory(module_id, 1)
+                print(f"[FORENSICS] Salvaged module package: {module_library[module_id].get('name', module_id)}.")
+
+            node.forensic_complete = True
+        else:
+            print("[FORENSICS] Crash image already archived. No fresh residue remains.")
+
+        input("\n[Press Enter to return to the route mesh...]")
+
+    def reward_node_clear(self, node, events_data, *, rooted: bool = False):
         node_rewards = events_data.get("nodes", {}).get(node.node_type, {})
+        if not rooted:
+            node.locked_data = True
+            print("[!] Node bricked. Loot channels collapsed and the data image is unrecoverable.")
+            return
         reward_min = node_rewards.get("reward_min", 20)
         reward_max = node_rewards.get("reward_max", reward_min)
         difficulty_bonus = node_rewards.get("difficulty_bonus", 0)
@@ -2599,105 +4094,234 @@ class TcodTerminalApp:
         input("\n[Press Enter to jack into the next day...]")
 
     def visit_shop(self, events_data):
-        shop_items = list(events_data.get("shops", {}).items())
         consumable_library = events_data.get("consumables", {})
-        if not shop_items:
+        module_library = events_data.get("modules", {})
+        shop_stock = self.build_shop_stock(events_data)
+        if not shop_stock:
             print("[sys] Black market relay offline. No goods available.")
             input("[Press Enter to return to the subnet map...]")
             return
 
-        while True:
-            self.clear_screen()
-            print("=== BLACK MARKET RELAY ===\n")
-            print(f"Wallet: {self.state.player_crypto} Crypto")
-            print(f"Trace:  {self.state.trace_level}\n")
-
-            for idx, (item_id, item) in enumerate(shop_items, start=1):
-                effect = item.get("type", "unknown")
-                amount = item.get("amount", 0)
-                if effect == "heal":
-                    desc = f"Restore {amount} Core OS"
-                elif effect == "ram":
-                    desc = f"+{amount} Max RAM permanently"
-                elif effect == "trace":
-                    desc = f"Reduce Trace by {amount}"
-                elif effect == "bot":
-                    desc = (
-                        f"Install helper bot ({item.get('ram_reservation', 1)} RAM reserved, "
-                        f"{item.get('script_ram_cap', 2)} RAM payload cap)"
+        self.set_shop_databank(shop_stock, consumable_library, module_library)
+        try:
+            while True:
+                self.clear_screen()
+                print("=== BLACK MARKET RELAY ===\n")
+                print(f"Wallet: {self.state.player_crypto} Crypto")
+                print(f"Trace:  {self.state.trace_level}\n")
+                if self.state.module_inventory:
+                    module_stock = ", ".join(
+                        f"{module_id}x{count}" for module_id, count in sorted(self.state.module_inventory.items())
                     )
-                elif effect == "consumable":
-                    item_ref = consumable_library.get(item.get("item_id", ""), {})
-                    qty = item.get("quantity", 1)
-                    desc = f"{item_ref.get('name', item.get('item_id', item_id))} x{qty}"
+                    print(f"Cached module stock: {module_stock}\n")
+
+                for idx, offer in enumerate(shop_stock, start=1):
+                    stock_kind = offer.get("stock_kind", offer.get("type", "unknown"))
+                    amount = offer.get("amount", 0)
+                    title = offer.get(
+                        "name",
+                        offer.get("item_id", offer.get("script_id", offer.get("flag_id", offer.get("module_id", offer.get("offer_id", "offer"))))),
+                    )
+                    if stock_kind == "script":
+                        script_id = offer.get("script_id", title)
+                        script_data = self.arsenal.scripts.get(script_id, {}) if self.arsenal else {}
+                        desc = f"{script_data.get('type', 'script').replace('_', '-')} | {script_data.get('ram', 0)} RAM"
+                    elif stock_kind == "flag":
+                        flag_id = offer.get("flag_id", title)
+                        flag_data = self.arsenal.flags.get(flag_id, {}) if self.arsenal else {}
+                        desc = f"modifier | +{flag_data.get('ram', 0)} RAM"
+                    elif stock_kind == "heal":
+                        desc = f"Restore {amount} Core OS"
+                    elif stock_kind == "ram":
+                        desc = f"+{amount} Max RAM permanently"
+                    elif stock_kind == "trace":
+                        desc = f"Reduce Trace by {amount}"
+                    elif stock_kind == "bot":
+                        desc = (
+                            f"Support bot ({offer.get('ram_reservation', 1)} RAM reserved, "
+                            f"{offer.get('script_ram_cap', 2)} RAM cap)"
+                        )
+                    elif stock_kind == "consumable":
+                        item_ref = consumable_library.get(offer.get("item_id", ""), {})
+                        qty = offer.get("quantity", 1)
+                        desc = f"{item_ref.get('name', offer.get('item_id', title))} x{qty}"
+                    elif stock_kind == "module":
+                        module_ref = module_library.get(offer.get("module_id", ""), {})
+                        qty = offer.get("quantity", 1)
+                        desc = f"{module_ref.get('name', offer.get('module_id', title))} x{qty}"
+                    else:
+                        desc = "Unknown payload"
+
+                    print(f"[{idx}] {title} | {offer.get('cost', 0)} Crypto | {desc}")
+
+                disconnect_idx = len(shop_stock) + 1
+                print(f"\n[{disconnect_idx}] Disconnect from relay")
+                choice = input("Select a purchase: ").strip()
+
+                if choice == str(disconnect_idx):
+                    return
+
+                if not choice.isdigit() or not (1 <= int(choice) <= len(shop_stock)):
+                    print("[sys] Invalid purchase order. Try again.")
+                    time.sleep(0.8)
+                    continue
+
+                selected_index = int(choice) - 1
+                offer = shop_stock[selected_index]
+                cost = offer.get("cost", 0)
+                if self.state.player_crypto < cost:
+                    print("[sys] Insufficient Crypto for that transaction.")
+                    time.sleep(0.8)
+                    continue
+
+                self.state.player_crypto -= cost
+                stock_kind = offer.get("stock_kind", offer.get("type", "unknown"))
+                amount = offer.get("amount", 0)
+                purchase_ok = True
+
+                if stock_kind == "script":
+                    script_id = offer.get("script_id")
+                    if not self.arsenal or script_id not in self.arsenal.scripts:
+                        purchase_ok = False
+                    else:
+                        self.player.grant_script(script_id)
+                        script_data = self.arsenal.scripts.get(script_id, {})
+                        print(f"[+] Installed {script_id}. {script_data.get('description', '').strip()}")
+                elif stock_kind == "flag":
+                    flag_id = offer.get("flag_id")
+                    if not self.arsenal or flag_id not in self.arsenal.flags:
+                        purchase_ok = False
+                    else:
+                        self.player.grant_flag(flag_id)
+                        flag_data = self.arsenal.flags.get(flag_id, {})
+                        print(f"[+] Installed {flag_id}. {flag_data.get('description', '').strip()}")
+                elif stock_kind == "heal":
+                    os_core = self.player.subsystems["OS"]
+                    restored = min(os_core.max_hp - os_core.current_hp, amount)
+                    os_core.current_hp += restored
+                    print(f"[+] Applied {offer.get('name', offer.get('offer_id', 'patch'))}. Restored {restored} Core OS.")
+                elif stock_kind == "ram":
+                    self.player.max_ram += amount
+                    self.player.current_ram = self.player.max_ram
+                    print(f"[+] Overclock stable. Max RAM increased to {self.player.max_ram} GB.")
+                elif stock_kind == "trace":
+                    old_trace = self.state.trace_level
+                    self.state.trace_level = max(0, self.state.trace_level - amount)
+                    removed = old_trace - self.state.trace_level
+                    print(f"[+] Trace scrub complete. Reduced Trace by {removed}.")
+                elif stock_kind == "bot":
+                    bot = self.player.install_support_bot(
+                        name=offer.get("name", offer.get("offer_id", "bot")),
+                        ram_reservation=offer.get("ram_reservation", 1),
+                        script_ram_cap=offer.get("script_ram_cap", 2),
+                        cadence=offer.get("cadence", 2),
+                    )
+                    print(
+                        f"[+] {bot.name} installed. It reserves {bot.ram_reservation} RAM and can run "
+                        f"payloads up to {bot.script_ram_cap} RAM every {bot.cadence} turns."
+                    )
+                    print("[sys] Support bot installed. Payload bay is idle until configured.")
+                elif stock_kind == "consumable":
+                    item_ref = offer.get("item_id")
+                    qty = offer.get("quantity", 1)
+                    if item_ref not in consumable_library:
+                        purchase_ok = False
+                    else:
+                        self.player.grant_consumable(item_ref, qty)
+                        label = consumable_library[item_ref].get("name", item_ref)
+                        print(f"[+] Stocked {label} x{qty}.")
+                elif stock_kind == "module":
+                    module_id = offer.get("module_id")
+                    qty = offer.get("quantity", 1)
+                    if module_id not in module_library:
+                        purchase_ok = False
+                    else:
+                        self.state.grant_module_inventory(module_id, qty)
+                        label = module_library[module_id].get("name", module_id)
+                        print(f"[+] Cached {label} x{qty}. Install it from a rooted node shell.")
                 else:
-                    desc = "Unknown payload"
+                    purchase_ok = False
 
-                print(f"[{idx}] {item.get('name', item_id)} | {item.get('cost', 0)} Crypto | {desc}")
-
-            disconnect_idx = len(shop_items) + 1
-            print(f"\n[{disconnect_idx}] Disconnect from relay")
-            choice = input("Select a purchase: ").strip()
-
-            if choice == str(disconnect_idx):
-                return
-
-            if not choice.isdigit() or not (1 <= int(choice) <= len(shop_items)):
-                print("[sys] Invalid purchase order. Try again.")
-                time.sleep(0.8)
-                continue
-
-            item_id, item = shop_items[int(choice) - 1]
-            cost = item.get("cost", 0)
-            if self.state.player_crypto < cost:
-                print("[sys] Insufficient Crypto for that transaction.")
-                time.sleep(0.8)
-                continue
-
-            self.state.player_crypto -= cost
-            effect = item.get("type", "unknown")
-            amount = item.get("amount", 0)
-
-            if effect == "heal":
-                os_core = self.player.subsystems["OS"]
-                restored = min(os_core.max_hp - os_core.current_hp, amount)
-                os_core.current_hp += restored
-                print(f"[+] Applied {item.get('name', item_id)}. Restored {restored} Core OS.")
-            elif effect == "ram":
-                self.player.max_ram += amount
-                self.player.current_ram = self.player.max_ram
-                print(f"[+] Overclock stable. Max RAM increased to {self.player.max_ram} GB.")
-            elif effect == "trace":
-                old_trace = self.state.trace_level
-                self.state.trace_level = max(0, self.state.trace_level - amount)
-                removed = old_trace - self.state.trace_level
-                print(f"[+] Trace scrub complete. Reduced Trace by {removed}.")
-            elif effect == "bot":
-                bot = self.player.install_support_bot(
-                    name=item.get("name", item_id),
-                    ram_reservation=item.get("ram_reservation", 1),
-                    script_ram_cap=item.get("script_ram_cap", 2),
-                    cadence=item.get("cadence", 2),
-                )
-                print(
-                    f"[+] {bot.name} installed. It reserves {bot.ram_reservation} RAM and can run "
-                    f"payloads up to {bot.script_ram_cap} RAM every {bot.cadence} turns."
-                )
-                print("[sys] Support bot installed. Payload bay is idle until configured.")
-            elif effect == "consumable":
-                item_ref = item.get("item_id")
-                qty = item.get("quantity", 1)
-                if item_ref not in consumable_library:
+                if not purchase_ok:
                     self.state.player_crypto += cost
                     print("[sys] Vendor payload corrupted. Refunding transaction.")
                 else:
-                    self.player.grant_consumable(item_ref, qty)
-                    label = consumable_library[item_ref].get("name", item_ref)
-                    print(f"[+] Stocked {label} x{qty}. Use it in combat with `use {item_ref}`.")
-            else:
-                self.state.player_crypto += cost
-                print("[sys] Vendor payload corrupted. Refunding transaction.")
+                    shop_stock.pop(selected_index)
+                    self.checkpoint_progress()
 
+                if shop_stock:
+                    self.set_shop_databank(shop_stock, consumable_library, module_library)
+                else:
+                    self.clear_shop_databank()
+                    print("[sys] Relay inventory exhausted.")
+                    time.sleep(1.0)
+                    return
+                time.sleep(1.0)
+        finally:
+            self.clear_shop_databank()
+
+    def manage_rooted_node(self, node, world, events_data):
+        module_library = events_data.get("modules", {})
+        if not node.root_access:
+            print("[sys] This node is resolved but offers no retained shell access.")
+            input("[Press Enter to return to the route mesh...]")
+            return
+
+        self.state.claim_rooted_node(node)
+        while True:
+            self.clear_screen()
+            print("=== ROOTED NODE SHELL ===\n")
+            print(f"Node:   {node.ip_address} ({node.node_type.upper()})")
+            print(f"Subnet: {world.subnet_name}")
+            print(f"Flags:  {', '.join(node.map_flags) if node.map_flags else 'none'}")
+            print(f"Slot:   {node.installed_module or 'open'} / {node.module_slots}\n")
+
+            if node.installed_module:
+                module_data = module_library.get(node.installed_module, {})
+                print(f"Installed: {module_data.get('name', node.installed_module)}")
+                print(f"          {module_data.get('description', 'No module notes loaded.')}\n")
+            else:
+                print("Installed: none\n")
+
+            if self.state.module_inventory:
+                print("Module inventory:")
+                for idx, (module_id, count) in enumerate(sorted(self.state.module_inventory.items()), start=1):
+                    module_data = module_library.get(module_id, {})
+                    print(
+                        f"[{idx}] {module_data.get('name', module_id)} x{count} | "
+                        f"{module_data.get('description', 'No notes loaded.')}"
+                    )
+                print("")
+            else:
+                print("Module inventory: empty\n")
+
+            print("[A] Hop here")
+            print("[X] Return to route mesh")
+            choice = input("Install module #: ").strip().lower()
+
+            if choice in {"x", ""}:
+                return
+            if choice == "a":
+                print(f"[sys] Hop pinned to {node.ip_address}.")
+                time.sleep(0.8)
+                return
+            if not choice.isdigit():
+                print("[sys] Invalid module order.")
+                time.sleep(0.8)
+                continue
+
+            inventory_items = sorted(self.state.module_inventory.items())
+            index = int(choice) - 1
+            if not (0 <= index < len(inventory_items)):
+                print("[sys] Invalid module order.")
+                time.sleep(0.8)
+                continue
+
+            module_id, _count = inventory_items[index]
+            success, message = self.state.install_module_on_node(node, module_id)
+            print(f"[sys] {message}")
+            if success:
+                self.checkpoint_progress()
             time.sleep(1.0)
 
     def configure_single_support_bot(self, bot):
@@ -2815,10 +4439,12 @@ class TcodTerminalApp:
     def run_precombat_recon(self, node, enemy, combat):
         history = list(getattr(node, "recon_log", []))
         self.apply_objective_card(prebreach_recon_card())
+        combat.turn_phase = "recon"
+        soft_engaged = False
 
         while True:
             self.clear_screen()
-            print(f"[sys] Passive tap anchored on {node.ip_address}.")
+            print(f"[sys] Passive tap locked on {node.ip_address}.")
             print("Passive collection is live. Every successful scrape adds exposure.\n")
             enemy.print_status()
             print(f"[LINK EXPOSURE] {enemy.recon_exposure} | {enemy.get_recon_alert_text()}")
@@ -2835,12 +4461,27 @@ class TcodTerminalApp:
             lowered = choice.lower()
             if lowered == "engage":
                 node.recon_log = history[-8:]
-                return True
+                return "engage"
+
+            if lowered in {"soft", "soft engage", "soft-engage"}:
+                if soft_engaged:
+                    print("\n[sys] Soft engage already burned on this link. Keep scouting or commit the breach.")
+                    input("[Press Enter to continue recon...]")
+                    continue
+                survived, intel_lines = combat.run_soft_engage(enemy)
+                soft_engaged = True
+                history.append("[soft] opening response recorded")
+                for line in intel_lines:
+                    history.append(f"[soft] {line}")
+                node.recon_log = history[-8:]
+                if not survived or self.state.game_over:
+                    return "downed"
+                continue
 
             if lowered in {"abort", "back", "disconnect", "exit"}:
                 self.clear_objective()
                 node.recon_log = history[-8:]
-                return False
+                return "abort"
 
             success, message, alert_stage = combat.execute_recon_action(choice, enemy)
             print(f"\n{message}")
@@ -2859,6 +4500,75 @@ class TcodTerminalApp:
 
             input("[Press Enter to continue recon...]")
 
+    def run_cleanup_phase(self, node, enemy, result, events_data):
+        scrubbed = False
+        forensic_ready = node.compromise_state == "bricked" and not getattr(node, "forensic_complete", False)
+        self.apply_objective_card(cleanup_card(node.root_access, forensic_ready))
+
+        while True:
+            forensic_ready = node.compromise_state == "bricked" and not getattr(node, "forensic_complete", False)
+            self.apply_objective_card(cleanup_card(node.root_access, forensic_ready))
+            self.clear_screen()
+            print("=== PHASE 3 // CLEANUP ===\n")
+            print(f"Node: {node.ip_address}")
+            print(f"State: {node.compromise_state.upper()}   Trace: {self.state.trace_level}   Crypto: {self.state.player_crypto}")
+            if node.root_access:
+                print("Route flags held. The shell image stayed stable and one module slot is reserved here.")
+            else:
+                print("Crash image is cold. Loot channels are gone, but residue can still be worked for forensics.")
+            print("")
+            print("[status]   Review the link state again.")
+            if not scrubbed and self.state.trace_level > 0:
+                print("[scrub]    Burn residual telemetry and shave trace.")
+            if forensic_ready:
+                print("[forensics] Work the crash image before leaving.")
+            print("[done]     Return to the route mesh.")
+
+            choice = input("cleanup@node:~$ ").strip().lower()
+            if not choice:
+                continue
+
+            if choice == "status":
+                self.clear_screen()
+                print("=== CLEANUP STATUS ===\n")
+                print(f"Node: {node.ip_address}")
+                print(f"Resolution: {result.reason.upper() if result.reason else node.compromise_state.upper()}")
+                print(f"Trace: {self.state.trace_level}")
+                if enemy:
+                    print(f"Host alert memory: {enemy.get_recon_alert_text()}")
+                    adaptation = enemy.get_adaptation_summary()
+                    print(f"Host patches: {adaptation if adaptation else 'none observed'}")
+                print(f"Forensic image: {'open' if forensic_ready else 'cold'}")
+                input("\n[Press Enter to return to cleanup...]")
+                continue
+
+            if choice == "scrub":
+                if scrubbed:
+                    print("\n[sys] Cleanup scrub already spent on this node.")
+                    input("[Press Enter to continue cleanup...]")
+                    continue
+                if self.state.trace_level <= 0:
+                    print("\n[sys] Trace is already at zero.")
+                    input("[Press Enter to continue cleanup...]")
+                    continue
+                scrub_amount = min(self.state.trace_level, 2 + max(1, node.difficulty) + (1 if node.root_access else 0))
+                self.state.trace_level = max(0, self.state.trace_level - scrub_amount)
+                scrubbed = True
+                print(f"\n[SCRUB] Residual route noise burned off. Trace reduced by {scrub_amount}.")
+                input("[Press Enter to continue cleanup...]")
+                continue
+
+            if choice == "forensics" and forensic_ready:
+                self.investigate_forensic_node(node, events_data)
+                continue
+
+            if choice in {"done", "exit", "leave"}:
+                self.clear_objective()
+                return
+
+            print("\n[sys] Cleanup command not recognized on this node.")
+            input("[Press Enter to continue cleanup...]")
+
     def resolve_world_node(
         self,
         node,
@@ -2869,6 +4579,7 @@ class TcodTerminalApp:
         events_data,
         day_summary=None,
         cleared_count_before=0,
+        skip_recon=False,
     ):
         self.clear_screen()
         print(f"[sys] Routing to {node.ip_address}...")
@@ -2878,13 +4589,18 @@ class TcodTerminalApp:
             self.visit_shop(events_data)
             return True, False
 
-        enemy = self.build_enemy_for_node(node, enemies_data, modifiers, ability_library)
+        enemy = self.current_enemy if skip_recon and self.current_enemy else self.build_enemy_for_node(node, enemies_data, modifiers, ability_library)
         self.current_enemy = enemy
-        if not self.run_precombat_recon(node, enemy, combat):
-            self.current_enemy = None
-            print("\n[sys] Link cut before breach. Node remains unresolved.")
-            input("[Press Enter to return to the subnet map...]")
-            return False, False
+        if not skip_recon:
+            recon_result = self.run_precombat_recon(node, enemy, combat)
+            if recon_result == "downed":
+                self.current_enemy = None
+                return False, False
+            if recon_result != "engage":
+                self.current_enemy = None
+                print("\n[sys] Link cut before breach. Node remains unresolved.")
+                input("[Press Enter to return to the subnet map...]")
+                return False, False
 
         breach_alert_stage = enemy.get_recon_alert_stage()
         self.apply_objective_card(live_combat_card())
@@ -2904,6 +4620,21 @@ class TcodTerminalApp:
             input("[Press Enter to return to the subnet map...]")
             return False, False
 
+        node.compromise_state = "rooted" if result.reason == "rooted" else "bricked"
+        node.root_access = node.compromise_state == "rooted"
+        node.locked_data = node.compromise_state == "bricked"
+        node.module_slots = 1 if node.root_access else 0
+        node.forensic_complete = False if node.compromise_state == "bricked" else getattr(node, "forensic_complete", False)
+        node.revolt_state = None if node.root_access else getattr(node, "revolt_state", None)
+        node.map_flags = ["route-anchor", "root-shell"] if node.root_access else []
+        if node.root_access:
+            self.state.claim_rooted_node(node)
+
+        worm_seed = int((result.metadata or {}).get("worm_seed", 0))
+        if worm_seed > 0:
+            seed_worm(node, worm_seed, source=(result.metadata or {}).get("worm_source"))
+            print(f"[WORM] Residual traffic escaped the kill chain and seeded {node.ip_address}.")
+
         encounter_report = {
             "entry_alert_stage": breach_alert_stage,
             "signature_revealed": enemy.player_signature_revealed,
@@ -2911,33 +4642,24 @@ class TcodTerminalApp:
             "telemetry_count": len(enemy.telemetry_targets),
             "sto_destroyed": enemy.subsystems["STO"].is_destroyed,
             "sec_destroyed": enemy.subsystems["SEC"].is_destroyed,
+            "resolution": node.compromise_state,
+            "worm_seed": worm_seed,
         }
-        self.reward_node_clear(node, events_data)
+        self.reward_node_clear(node, events_data, rooted=node.root_access)
+        if node.root_access:
+            print("[+] Root access retained. Route flags and one module slot reserved on the node shell.")
+        else:
+            print("[!] Bricked node logged. Route unlock remains, and the hardware corpse can be revisited for forensics.")
         contract_messages = self.state.resolve_contracts_for_node(node, enemy, encounter_report)
         for message in contract_messages:
             print(message)
+        self.run_cleanup_phase(node, enemy, result, events_data)
+        self.active_tap_node_index = None
 
         if node.node_type == "gatekeeper":
-            completed_day = self.state.day
-            self.state.day += 1
-            self.state.trace_level = max(0, self.state.trace_level - 10)
-            if day_summary:
-                self.play_day_transition(
-                    completed_day,
-                    self.state.day,
-                    day_summary["world"],
-                    cleared_count_before + 1,
-                    day_summary["crypto"],
-                    day_summary["trace"],
-                    day_summary["brute"],
-                    day_summary["exploit"],
-                )
-            else:
-                print(f"\n[sys] Gatekeeper breach confirmed. Advancing to Day {self.state.day}.")
-            self.save_progress()
-            if not day_summary:
-                input("[Press Enter to route into the next subnet...]")
-            return True, True
+            print("\n[sys] Gatekeeper neutralized. Border controls for this subnet are open once the rest of the mesh is under control.")
+            input("[Press Enter to return to the subnet map...]")
+            return True, False
 
         input("[Press Enter to return to the subnet map...]")
         return True, False
@@ -2950,54 +4672,102 @@ class TcodTerminalApp:
         ability_library = game_data.get("enemies", {}).get("abilities", {})
         events_data = game_data.get("events", {})
 
-        while not self.state.game_over and self.running:
-            world = WorldGenerator.create_map(self.state.threat_ledger, self.state.day)
-            self.state.issue_world_contracts(world)
-            cleared_nodes = set()
-            self.route_sweep_level = 0
-            self.route_sweep_max = max(4, len(world.nodes) + 1)
+        while not self.state.game_over and self.running and not self.return_to_menu_requested:
+            network = self.state.active_network
+            if not network or getattr(network, "day", None) != self.state.day:
+                network = WorldGenerator.create_network(self.state)
+                if hasattr(network, "ensure_runtime_defaults"):
+                    network.ensure_runtime_defaults()
+                self.state.active_network = network
+                self.state.current_subnet_id = network.entry_subnet_id
+                self.active_tap_node_index = None
+                self.current_enemy = None
+                entry_subnet = network.get_subnet(network.entry_subnet_id)
+                self.state.current_domain_id = entry_subnet.domain_id if entry_subnet else None
+                world_tick_messages = self.state.issue_world_contracts(
+                    entry_subnet.world_map if entry_subnet else None,
+                    subnet_key=network.entry_subnet_id,
+                )
+                self.checkpoint_progress()
+            else:
+                if hasattr(network, "ensure_runtime_defaults"):
+                    network.ensure_runtime_defaults()
+                current_subnet = network.get_subnet(self.state.current_subnet_id or network.entry_subnet_id)
+                if current_subnet:
+                    self.state.bind_contract_inbox(current_subnet.subnet_id, current_subnet.world_map)
+                world_tick_messages = []
+
             day_summary = {
-                "world": world,
+                "world": network.get_subnet(self.state.current_subnet_id or network.entry_subnet_id).world_map,
                 "crypto": self.state.player_crypto,
                 "trace": self.state.trace_level,
                 "brute": self.state.threat_ledger.brute_force_noise,
                 "exploit": self.state.threat_ledger.exploit_noise,
             }
             self.clear_objective()
-            self.set_network_world(
-                world,
-                cleared_nodes,
-                None,
-                status_text=(
-                    f"{world.subnet_name} | Day {self.state.day} | "
-                    f"sweep {self.route_sweep_level}/{self.route_sweep_max} | passive mesh link"
-                ),
-            )
 
-            while not self.state.game_over and self.running:
+            while not self.state.game_over and self.running and not self.return_to_menu_requested:
+                current_subnet = network.get_subnet(self.state.current_subnet_id or network.entry_subnet_id)
+                if not current_subnet:
+                    self.state.active_network = None
+                    break
+                world = current_subnet.world_map
+                cleared_nodes = current_subnet.cleared_nodes
+                current_anchor = current_subnet.current_anchor
+                domain = network.get_domain(current_subnet.domain_id)
+                self.sync_active_subnet_view(network, current_subnet)
                 self.clear_objective()
-                self.set_network_world(
-                    world,
-                    cleared_nodes,
-                    None,
-                    status_text=(
-                        f"{world.subnet_name} | Day {self.state.day} | "
-                        f"sweep {self.route_sweep_level}/{self.route_sweep_max} | choose a route"
-                    ),
+                self.sync_active_subnet_view(network, current_subnet)
+                tap_index, tap_node, tap_enemy = self.get_active_tap_context(
+                    current_subnet,
+                    enemies_data=enemies_data,
+                    modifiers=modifiers,
+                    ability_library=ability_library,
                 )
+                if tap_node and tap_enemy:
+                    self.apply_objective_card(node_tap_card(tap_node.ip_address, tap_enemy.get_recon_alert_text()))
+                else:
+                    self.current_enemy = None
 
                 self.clear_screen()
-                print(f"\n=== CONNECTED TO: {world.subnet_name} | DAY {self.state.day} ===\n")
+                print(
+                    f"\n=== CONNECTED TO: {world.subnet_name} | {current_subnet.subnet_id} | "
+                    f"{domain.name if domain else current_subnet.domain_id} | DAY {self.state.day} ===\n"
+                )
                 print(
                     f"Wallet: {self.state.player_crypto} Crypto   "
                     f"Trace: {self.state.trace_level}   "
                     f"Noise: BF {self.state.threat_ledger.brute_force_noise} / EX {self.state.threat_ledger.exploit_noise}   "
-                    f"Sweep: {self.route_sweep_level}/{self.route_sweep_max}"
+                    f"Sweep: {current_subnet.sweep_level}/{current_subnet.sweep_max}"
                 )
-                print(
-                    "Breach the Gatekeeper whenever you think you're ready. "
-                    "mail opens the dead-drop inbox. Side nodes are optional prep. Locked nodes need a linked route.\n"
-                )
+                print(f"Foothold: {world.nodes[current_anchor].ip_address}")
+                if tap_node and tap_enemy:
+                    print(
+                        f"Tap: {tap_node.ip_address}   "
+                        f"Link: {tap_enemy.get_recon_alert_text()}   "
+                        f"Exposure: {tap_enemy.recon_exposure}"
+                    )
+                print("")
+                if self.has_standard_travel_unlock():
+                    neighbors = sorted(network.neighboring_subnet_ids(current_subnet.subnet_id))
+                    if neighbors:
+                        print("[ADJACENT SUBNETS]")
+                        print(f"{'ID':<6}{'SUBNET':<22}{'DOMAIN':<20}{'STATE':<12}")
+                        for subnet_id in neighbors:
+                            subnet = network.get_subnet(subnet_id)
+                            domain_label = network.get_domain(subnet.domain_id).name if network.get_domain(subnet.domain_id) else subnet.domain_id
+                            status = "SEALED"
+                            if current_subnet.is_conquered():
+                                status = "OPEN"
+                            if subnet.is_conquered():
+                                status = "CONQUERED"
+                            print(f"{subnet.subnet_id:<6}{subnet.subnet_name:<22}{domain_label:<20}{status:<12}")
+                        print("")
+                if world_tick_messages:
+                    for message in world_tick_messages:
+                        print(message)
+                    print("")
+                    world_tick_messages = []
 
                 type_labels = {
                     "personal": "PERSONAL",
@@ -3005,18 +4775,25 @@ class TcodTerminalApp:
                     "iot": "IPCAM",
                     "server": "SERVER",
                     "corporate": "CORP",
+                    "lab": "LAB",
+                    "relay": "RELAY",
+                    "media": "MEDIA",
                     "honeypot": "HONEYPOT",
                     "shop": "MARKET",
-                    "gatekeeper": "GATEKEEPER",
+                    "gatekeeper": "BORDER",
                     "civilian": "CIVILIAN",
                 }
 
                 for idx, node in enumerate(world.nodes, start=1):
                     node_index = idx - 1
                     if node_index in cleared_nodes:
-                        status = "CLEARED"
+                        status = self.get_node_status_text(node_index, node, cleared_nodes)
                         label = type_labels.get(node.node_type, node.node_type.upper())
-                        intel_line = None
+                        if getattr(node, "compromise_state", "") == "rooted":
+                            label = "ROOT"
+                        elif getattr(node, "compromise_state", "") == "bricked":
+                            label = "FORENSIC" if not getattr(node, "forensic_complete", False) else "BRICK"
+                        intel_line = self.build_node_intel_summary(node)
                     elif node.node_type == "shop":
                         status = "MARKET"
                         label = type_labels.get(node.node_type, node.node_type.upper())
@@ -3033,20 +4810,16 @@ class TcodTerminalApp:
                         intel_line = self.build_node_intel_summary(node)
 
                     print(f"{node.ip_address:<15} | {label:<10} | DIFF {node.difficulty:<2} | {status}")
-                    if status == "LOCKED":
-                        unlock_sources = [
-                            world.nodes[source_index].ip_address.split(".")[-1]
-                            for source_index in world.get_unlock_sources(node_index)
-                        ]
-                        if unlock_sources:
-                            intel_line = f"route via {' / '.join(unlock_sources[:3])}"
                     if intel_line:
                         print(f"    {intel_line}")
 
                 print("\n[BOT] Configure support bots")
                 print("[MAIL] Review dead-drop inbox")
+                if self.has_standard_travel_unlock():
+                    print("[SUBNETS] Open route registry")
                 print("[S] Save and disconnect")
-                choice = input("Select node by IP: ").strip().lower()
+                prompt = f"hop@{tap_node.ip_address}:~$ " if tap_node else "Select node IP or route command: "
+                choice = input(prompt).strip().lower()
 
                 if choice == "bot":
                     self.configure_support_bots()
@@ -3056,10 +4829,192 @@ class TcodTerminalApp:
                     self.view_contract_inbox(world)
                     continue
 
+                if choice == "subnets":
+                    if not self.has_standard_travel_unlock():
+                        print("[sys] Unknown command.")
+                        time.sleep(0.8)
+                        continue
+                    self.clear_screen()
+                    for line in self.build_subnet_registry_lines(network, current_subnet.subnet_id):
+                        print(line)
+                    input("\n[Press Enter to return to the route mesh...]")
+                    continue
+
+                if choice.startswith("travel "):
+                    if not self.has_standard_travel_unlock():
+                        print("[sys] Unknown command.")
+                        time.sleep(0.8)
+                        continue
+                    target_token = choice.split(None, 1)[1].strip()
+                    target_subnet_id = network.resolve_subnet_target(target_token, current_subnet.subnet_id)
+                    if not target_subnet_id or target_subnet_id == current_subnet.subnet_id:
+                        print("[sys] Travel target invalid.")
+                        time.sleep(0.8)
+                        continue
+                    if target_subnet_id not in current_subnet.neighbors:
+                        print("[sys] Travel target invalid.")
+                        time.sleep(1.0)
+                        continue
+                    if self.subnet_is_locked_for_standard_travel(current_subnet):
+                        print("[sys] Border lock active.")
+                        time.sleep(1.0)
+                        continue
+                    self.state.current_subnet_id = target_subnet_id
+                    self.active_tap_node_index = None
+                    self.current_enemy = None
+                    target_subnet = network.get_subnet(target_subnet_id)
+                    self.state.current_domain_id = target_subnet.domain_id
+                    self.state.bind_contract_inbox(target_subnet.subnet_id, target_subnet.world_map)
+                    world_tick_messages = [f"[TRANSIT] Routed into {target_subnet.subnet_name} via standard border hop."]
+                    world_tick_messages.extend(self.advance_world_dynamics(network, events_data))
+                    self.checkpoint_progress()
+                    continue
+
+                if choice.startswith("supercruise "):
+                    if not self.has_supercruise_unlock():
+                        print("[sys] Unknown command.")
+                        time.sleep(0.8)
+                        continue
+                    target_token = choice.split(None, 1)[1].strip()
+                    target_subnet_id = network.resolve_subnet_target(target_token, current_subnet.subnet_id)
+                    if not target_subnet_id or target_subnet_id == current_subnet.subnet_id:
+                        print("[sys] Supercruise target invalid.")
+                        time.sleep(0.8)
+                        continue
+                    jump_success, jump_messages = self.apply_supercruise_penalty(
+                        network,
+                        current_subnet.subnet_id,
+                        target_subnet_id,
+                    )
+                    world_tick_messages = jump_messages
+                    if jump_success:
+                        self.state.current_subnet_id = target_subnet_id
+                        self.active_tap_node_index = None
+                        self.current_enemy = None
+                        target_subnet = network.get_subnet(target_subnet_id)
+                        self.state.current_domain_id = target_subnet.domain_id
+                        self.state.bind_contract_inbox(target_subnet.subnet_id, target_subnet.world_map)
+                    world_tick_messages.extend(self.advance_world_dynamics(network, events_data))
+                    self.checkpoint_progress()
+                    continue
+
                 if choice == "s":
                     self.save_progress()
                     self.shutdown_game()
                     return
+
+                if tap_node and tap_enemy:
+                    if choice in {"leave", "back", "disconnect", "exit"}:
+                        self.active_tap_node_index = None
+                        self.current_enemy = None
+                        continue
+
+                    if choice == "recon":
+                        self.clear_screen()
+                        print(f"[sys] Passive tap active on {tap_node.ip_address}.\n")
+                        tap_enemy.print_status()
+                        print(f"\n[LINK STATE] {tap_enemy.get_recon_alert_text()} | exposure {tap_enemy.recon_exposure}")
+                        tap_history = list(getattr(tap_node, "recon_log", []))
+                        if tap_history:
+                            print("\n[READBACK]")
+                            for line in tap_history[-6:]:
+                                print(line)
+                        input("\n[Press Enter to return to the live hop...]")
+                        continue
+
+                    if choice == "engage":
+                        node_cleared, _advanced_day = self.resolve_world_node(
+                            tap_node,
+                            combat,
+                            enemies_data,
+                            modifiers,
+                            ability_library,
+                            events_data,
+                            day_summary=day_summary,
+                            cleared_count_before=len(cleared_nodes),
+                            skip_recon=True,
+                        )
+
+                        if self.state.game_over or not self.running or self.return_to_menu_requested:
+                            return
+
+                        if node_cleared:
+                            cleared_nodes.add(tap_index)
+                            current_subnet.current_anchor = tap_index
+                            if current_subnet.is_conquered():
+                                self.state.mark_subnet_conquered(current_subnet.subnet_id)
+                            world_tick_messages.extend(self.advance_world_dynamics(network, events_data))
+                            self.checkpoint_progress()
+
+                            if current_subnet.is_conquered():
+                                print(f"\n[sys] Subnet {current_subnet.subnet_id} is fully conquered. Border travel is now open.")
+                                if network.all_subnets_conquered():
+                                    completed_day = self.state.day
+                                    self.state.day += 1
+                                    self.state.trace_level = max(0, self.state.trace_level - 10)
+                                    self.play_day_transition(
+                                        completed_day,
+                                        self.state.day,
+                                        world,
+                                        sum(len(subnet.cleared_nodes) for subnet in network.subnets.values()),
+                                        day_summary["crypto"],
+                                        day_summary["trace"],
+                                        day_summary["brute"],
+                                        day_summary["exploit"],
+                                    )
+                                    self.state.active_network = None
+                                    self.state.current_subnet_id = None
+                                    self.state.current_domain_id = None
+                                    self.active_tap_node_index = None
+                                    self.current_enemy = None
+                                    self.state.subnet_contract_inboxes = {}
+                                    self.state.current_contracts = []
+                                    self.state.bound_contract_subnet_id = None
+                                    self.checkpoint_progress()
+                                    break
+                                input("[Press Enter to stabilize the conquered border...]")
+                            else:
+                                self.advance_counter_sweep()
+                                current_subnet.sweep_level = self.route_sweep_level
+                                current_subnet.sweep_max = self.route_sweep_max
+                                self.sync_active_subnet_view(network, current_subnet)
+                                input("[Press Enter to stabilize the route mesh...]")
+                        continue
+
+                    if choice in {"soft", "soft engage", "soft-engage"}:
+                        survived, intel_lines = combat.run_soft_engage(tap_enemy)
+                        tap_history = list(getattr(tap_node, "recon_log", []))
+                        tap_history.append("[soft] opening response recorded")
+                        for line in intel_lines:
+                            tap_history.append(f"[soft] {line}")
+                        tap_node.recon_log = tap_history[-8:]
+                        self.checkpoint_progress()
+                        if not survived or self.state.game_over:
+                            return
+                        continue
+
+                    try:
+                        parsed_tap = self.arsenal.parse_command(choice, owner=self.player) if self.arsenal else None
+                    except ValueError:
+                        parsed_tap = None
+                    if parsed_tap and self.arsenal.scripts.get(parsed_tap.base_cmd, {}).get("type") == "scan":
+                        success, message, alert_stage = combat.execute_recon_action(choice, tap_enemy)
+                        print(f"\n{message}")
+                        if success:
+                            tap_history = list(getattr(tap_node, "recon_log", []))
+                            tap_history.append(strip_ansi(message))
+                            tap_node.recon_log = tap_history[-8:]
+                        if alert_stage == 1:
+                            print("[!] COUNTER-SCAN: the host has a rough map of your node now.")
+                        elif alert_stage == 2:
+                            print("[!] COUNTER-SCAN: your signature leaked. This breach is now hot.")
+                        self.checkpoint_progress()
+                        input("[Press Enter to return to the passive tap...]")
+                        continue
+                    if parsed_tap:
+                        print("[sys] That payload needs a live breach. Use engage first.")
+                        time.sleep(0.9)
+                        continue
 
                 node_index = next((idx for idx, node in enumerate(world.nodes) if node.ip_address.lower() == choice), -1)
                 if not (0 <= node_index < len(world.nodes)):
@@ -3067,63 +5022,62 @@ class TcodTerminalApp:
                     time.sleep(0.8)
                     continue
 
+                node = world.nodes[node_index]
+                if getattr(node, "compromise_state", "") == "bricked" and node_index not in cleared_nodes:
+                    cleared_nodes.add(node_index)
+
                 if node_index in cleared_nodes:
-                    print("[sys] That node has already been resolved.")
-                    time.sleep(0.8)
+                    self.active_tap_node_index = None
+                    self.current_enemy = None
+                    can_revisit = world.can_traverse_from(current_anchor, node_index, cleared_nodes)
+                    can_fast_travel = self.state.can_fast_travel_to(node)
+                    if not can_revisit and not can_fast_travel:
+                        print("[sys] That node is outside your live local route mesh.")
+                        time.sleep(0.9)
+                        continue
+
+                    current_subnet.current_anchor = node_index
+                    self.sync_active_subnet_view(network, current_subnet)
+
+                    if node.root_access and getattr(node, "revolt_state", None):
+                        self.defend_rooted_node(
+                            node,
+                            node_index,
+                            current_subnet,
+                            world,
+                            combat,
+                            enemies_data,
+                            ability_library,
+                            events_data,
+                        )
+                    elif getattr(node, "compromise_state", "") == "bricked":
+                        self.investigate_forensic_node(
+                            node,
+                            node_index,
+                            current_subnet,
+                            enemies_data,
+                            modifiers,
+                            ability_library,
+                            events_data,
+                        )
+                    elif node.root_access:
+                        self.manage_rooted_node(node, world, events_data)
+                    else:
+                        print("[sys] That node has already been resolved.")
+                        time.sleep(0.8)
                     continue
 
-                if not world.can_route_to(node_index, cleared_nodes):
-                    unlock_sources = [world.nodes[source_index].ip_address for source_index in world.get_unlock_sources(node_index)]
-                    if unlock_sources:
-                        print(f"[sys] Route locked. Pivot through {', '.join(unlock_sources[:3])} first.")
-                    else:
-                        print("[sys] Route locked. No clean path from your current footholds yet.")
+                if not world.can_traverse_from(current_anchor, node_index, cleared_nodes):
+                    print("[sys] Route locked.")
                     time.sleep(1.0)
                     continue
 
-                node = world.nodes[node_index]
-                self.set_network_world(
-                    world,
-                    cleared_nodes,
-                    node_index,
-                    status_text=(
-                        f"{world.subnet_name} | sweep {self.route_sweep_level}/{self.route_sweep_max} | "
-                        f"routing {node.ip_address}"
-                    ),
-                )
-
-                node_cleared, advanced_day = self.resolve_world_node(
-                    node,
-                    combat,
-                    enemies_data,
-                    modifiers,
-                    ability_library,
-                    events_data,
-                    day_summary=day_summary,
-                    cleared_count_before=len(cleared_nodes),
-                )
-
-                if self.state.game_over or not self.running:
-                    return
-
-                if node_cleared:
-                    cleared_nodes.add(node_index)
-
-                if not advanced_day:
-                    self.advance_counter_sweep()
-                    self.set_network_world(
-                        world,
-                        cleared_nodes,
-                        None,
-                        status_text=(
-                            f"{world.subnet_name} | Day {self.state.day} | "
-                            f"counter-sweep {self.route_sweep_level}/{self.route_sweep_max}"
-                        ),
-                    )
-                    input("[Press Enter to stabilize the route mesh...]")
-
-                if advanced_day:
-                    break
+                current_subnet.current_anchor = node_index
+                self.sync_active_subnet_view(network, current_subnet)
+                self.active_tap_node_index = node_index
+                self.current_enemy = self.build_enemy_for_node(node, enemies_data, modifiers, ability_library)
+                self.apply_objective_card(node_tap_card(node.ip_address, self.current_enemy.get_recon_alert_text()))
+                self.checkpoint_progress()
 
     def run_game(self):
         original_input = builtins.input
@@ -3184,23 +5138,27 @@ class TcodTerminalApp:
                     if choice == "3":
                         print("\n[sys] Locating save state...")
                         time.sleep(0.4)
-                        save_data = GameState.load_session()
+                        save_reference = self.selected_save_reference or GameState.AUTOSAVE_SLOT_KEY
+                        save_data = GameState.load_session(slot_key=save_reference)
                         if save_data:
                             state = save_data["state"]
                             player = save_data["player"]
                             state.ensure_runtime_defaults()
                             player.ensure_runtime_defaults()
                             if state.game_over:
-                                GameState.delete_session()
+                                GameState.delete_session(slot_key=save_reference)
                                 print("[sys] Save archive was flagged dead. Wiped.")
                                 time.sleep(0.8)
                                 continue
                             print("[sys] Save state restored successfully.")
                             time.sleep(0.8)
+                            self.active_save_reference = save_reference
+                            self.selected_save_reference = None
                             session_loaded = True
                             continue
                         print("\n[sys] ERROR: No local save state detected. Save/Load module offline.\n")
                         time.sleep(1.0)
+                        self.selected_save_reference = None
                         continue
 
                     print("\n[sys] Invalid selection. Core command not recognized.\n")
@@ -3243,10 +5201,18 @@ class TcodTerminalApp:
                     print(f"\n[sys] Resuming session... (Day {state.day})")
                     time.sleep(0.8)
 
+                if self.return_to_menu_requested:
+                    self.reset_frontend_state()
+                    continue
+
                 self.run_world_cycle(combat, game_data)
 
                 if not self.running:
                     return
+
+                if self.return_to_menu_requested:
+                    self.reset_frontend_state()
+                    continue
 
                 if self.state and self.state.game_over:
                     self.handle_permadeath()
@@ -3577,10 +5543,8 @@ class TcodTerminalApp:
                 entry_x, entry_y = positions[entry_index]
                 self.draw_line(console, root_x + 3, root_y, entry_x, entry_y, ".", self.COLORS["line"])
 
-        for left_index, linked in getattr(self.map_world, "links", {}).items():
+        for left_index, linked in getattr(self.map_world, "forward_links", {}).items():
             for right_index in linked:
-                if right_index <= left_index:
-                    continue
                 if left_index not in positions or right_index not in positions:
                     continue
                 left_pos = positions[left_index]
@@ -3589,6 +5553,10 @@ class TcodTerminalApp:
                 if left_index in self.map_cleared or right_index in self.map_cleared:
                     line_color = self.COLORS["green"]
                 self.draw_line(console, left_pos[0], left_pos[1], right_pos[0], right_pos[1], ".", line_color)
+                arrow = ">" if right_pos[0] >= left_pos[0] else "<"
+                arrow_x = right_pos[0] - 1 if right_pos[0] > left_pos[0] else right_pos[0] + 1
+                if x <= arrow_x < x + w and map_top <= right_pos[1] < map_top + map_height:
+                    console.print(arrow_x, right_pos[1], arrow, fg=line_color)
 
         sweep_ratio = 0 if self.route_sweep_max <= 0 else self.route_sweep_level / max(1, self.route_sweep_max)
         sweep_color = self.COLORS["green"] if sweep_ratio < 0.4 else self.COLORS["yellow"] if sweep_ratio < 0.75 else self.COLORS["red"]
@@ -3600,7 +5568,14 @@ class TcodTerminalApp:
             node_x, node_y = positions[index]
             is_cleared = index in self.map_cleared
             is_active = index == self.map_active
-            is_locked = self.map_world and not self.map_world.can_route_to(index, self.map_cleared) and not is_cleared
+            anchor_index = self.map_active
+            if anchor_index is None and self.map_world.entry_links:
+                anchor_index = min(self.map_world.entry_links)
+            is_locked = (
+                self.map_world
+                and not self.map_world.can_traverse_from(anchor_index, index, self.map_cleared)
+                and not is_cleared
+            )
 
             if node.node_type == "shop":
                 glyph = "$"
@@ -3640,13 +5615,15 @@ class TcodTerminalApp:
                 marker_x = clamp(node_x + 1, x, x + w - 1)
                 console.print(marker_x, node_y, "!", fg=self.COLORS["yellow"])
             if node.node_type == "gatekeeper":
-                label = "FIN"
+                label = "BDR"
             elif node.node_type == "shop":
                 label = "MKT"
             elif is_cleared:
                 label = "CLR"
             elif is_locked:
                 label = "LCK"
+            elif getattr(node, "lockdown_turns", 0) > 0:
+                label = "ALR"
             else:
                 label = node.ip_address.split(".")[-1]
             label_x = clamp(node_x - (len(label) // 2), x, x + max(0, w - len(label)))

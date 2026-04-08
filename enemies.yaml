@@ -373,6 +373,39 @@ enemies:
     loot_table: "high_tier"
     disconnect_lock: false
 
+  sandbox_array:
+    name: "Sandbox Array"
+    description: "A development cluster full of debug services, staging snapshots, and half-removed safety rails."
+    weapon: "Debug panic loop"
+    base_os: 18
+    budget: 12
+    weakness: "MEM"
+    abilities: ["port_sweep", "exploit_fingerprint", "heap_shred", "cache_patch", "trace_route"]
+    loot_table: "mid_tier"
+    disconnect_lock: false
+
+  relay_exchange:
+    name: "Relay Exchange"
+    description: "A transit handoff node moving mail, DNS, and cached routes through a cramped edge fabric."
+    weapon: "Transit choke"
+    base_os: 18
+    budget: 12
+    weakness: "NET"
+    abilities: ["port_sweep", "exploit_fingerprint", "dns_maze", "packet_storm", "trace_route", "proxy_splitter"]
+    loot_table: "mid_tier"
+    disconnect_lock: false
+
+  cdn_edge:
+    name: "CDN Edge Cache"
+    description: "A media edge full of warm caches, sloppy purge jobs, and too many public-facing surfaces."
+    weapon: "Cache stampede"
+    base_os: 16
+    budget: 10
+    weakness: "STO"
+    abilities: ["port_sweep", "sector_chew", "packet_storm", "cache_patch"]
+    loot_table: "mid_tier"
+    disconnect_lock: false
+
   omnicorp_gateway:
     name: "OmniCorp Gateway"
     description: "A hardened enterprise edge relay with adaptive counter-intrusion logic and disciplined operators."
@@ -405,6 +438,28 @@ enemies:
     weakness: "random"
     abilities: ["port_sweep", "exploit_fingerprint", "dns_maze", "tls_needle", "ram_lock", "trace_route", "patch_cycle", "defense_breach"]
     loot_table: "high_tier"
+    disconnect_lock: false
+
+  antivirus_reclaimer:
+    name: "Antivirus Reclaimer"
+    description: "A reclaim daemon sent to scrub your rooted shell, quarantine your tooling, and tear your foothold back out of the route mesh."
+    weapon: "Quarantine sweep"
+    base_os: 18
+    budget: 12
+    weakness: "NET"
+    abilities: ["port_sweep", "exploit_fingerprint", "firewall_shunt", "trace_route", "ram_lock", "defense_breach"]
+    loot_table: "none"
+    disconnect_lock: false
+
+  white_hat_reclaimer:
+    name: "White Hat Reclaimer"
+    description: "An operator-grade cleanup host trying to restore the node, wipe your shell, and close the breach behind you."
+    weapon: "Incident response stack"
+    base_os: 17
+    budget: 11
+    weakness: "SEC"
+    abilities: ["port_sweep", "exploit_fingerprint", "proxy_splitter", "patch_cycle", "trace_route", "defense_breach"]
+    loot_table: "none"
     disconnect_lock: false
 
   aegis_black_ice:

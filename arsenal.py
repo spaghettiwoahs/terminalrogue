@@ -1,11 +1,14 @@
 import random
 from dataclasses import dataclass
 
+from payload_dna import build_payload_signature, merge_payload_dna, normalize_payload_dna
+
 
 class CommandResult:
-    def __init__(self, success: bool, message: str):
+    def __init__(self, success: bool, message: str, metadata: dict | None = None):
         self.success = success
         self.message = message
+        self.metadata = metadata or {}
 
 
 @dataclass
@@ -23,6 +26,10 @@ class Arsenal:
         self.flags = arsenal_data.get("flags", {}) if arsenal_data else {}
         self.alias_map = {}
         for command_name, script_data in self.scripts.items():
+            script_data["_dna"] = normalize_payload_dna(script_data.get("dna"))
+        for flag_name, flag_data in self.flags.items():
+            flag_data["_dna"] = normalize_payload_dna(flag_data.get("dna"))
+        for command_name, script_data in self.scripts.items():
             for alias in script_data.get("aliases", []):
                 self.alias_map[alias] = command_name
 
@@ -34,6 +41,18 @@ class Arsenal:
         if owner and hasattr(owner, "owns_flag"):
             allowed_flags = [flag for flag in allowed_flags if owner.owns_flag(flag)]
         return allowed_flags
+
+    def get_script_dna(self, script_name: str) -> dict[str, tuple[str, ...]]:
+        return dict(self.scripts.get(script_name, {}).get("_dna") or normalize_payload_dna(None))
+
+    def get_flag_dna(self, flag_name: str) -> dict[str, tuple[str, ...]]:
+        return dict(self.flags.get(flag_name, {}).get("_dna") or normalize_payload_dna(None))
+
+    def get_payload_dna(self, command: ParsedCommand | str, owner=None) -> dict[str, tuple[str, ...]]:
+        parsed = command if isinstance(command, ParsedCommand) else self.parse_command(command, owner=owner)
+        dna_records = [self.get_script_dna(parsed.base_cmd)]
+        dna_records.extend(self.get_flag_dna(flag) for flag in parsed.flags)
+        return merge_payload_dna(*dna_records)
 
     def describe_flag_stack(self, command: ParsedCommand | str, owner=None) -> list[str]:
         parsed = command if isinstance(command, ParsedCommand) else self.parse_command(command, owner=owner)
@@ -69,6 +88,8 @@ class Arsenal:
                     f"--volatile -> unsafe overclock: +{data.get('damage_bonus', 0)} damage, "
                     f"+{data.get('noise_bonus', 0)} trace noise."
                 )
+            elif flag == "--cascade":
+                notes.append("--cascade -> forces extra spillover through adjacent subsystem buses.")
             else:
                 notes.append(f"{flag} -> modifier armed.")
         return notes
@@ -141,6 +162,127 @@ class Arsenal:
             cost += self.flags[flag]["ram"]
         return cost
 
+    def get_resolved_target(self, parsed: ParsedCommand):
+        script_data = self.scripts.get(parsed.base_cmd, {})
+        if parsed.target_subsystem:
+            return parsed.target_subsystem
+        default_target = script_data.get("default_target")
+        if default_target:
+            return str(default_target).upper()
+        if script_data.get("type") in {"brute_force", "exploit"}:
+            return "OS"
+        return None
+
+    def build_attack_profile(self, parsed: ParsedCommand, player, enemy, game_state=None):
+        script_data = self.scripts[parsed.base_cmd]
+        script_type = script_data.get("type", "unknown")
+        target_subsystem = self.get_resolved_target(parsed) or "OS"
+        payload_dna = self.get_payload_dna(parsed)
+
+        if target_subsystem not in enemy.subsystems:
+            raise ValueError(f"Error: Target subsystem [{target_subsystem}] does not exist.")
+
+        target = enemy.subsystems[target_subsystem]
+        if target.is_destroyed:
+            raise ValueError(f"Error: Target [{target_subsystem}] is already offline.")
+
+        base_damage = script_data.get("damage", 0)
+        is_weakness = target_subsystem == enemy.weakness
+
+        base_damage += sum(self.flags.get(flag, {}).get("damage_bonus", 0) for flag in parsed.flags)
+
+        if parsed.base_cmd == "ping":
+            if target_subsystem == "NET":
+                base_damage += 1
+        elif parsed.base_cmd == "masscan":
+            base_damage = 0
+        elif parsed.base_cmd == "hydra":
+            if enemy.has_auth_surface(target_subsystem):
+                base_damage += 3
+            else:
+                base_damage = max(1, base_damage - 3)
+            if enemy.has_credential_pressure(target_subsystem):
+                base_damage += 2
+        elif parsed.base_cmd == "ddos":
+            if target_subsystem in {"NET", "SEC"}:
+                base_damage += 2
+            botnet_power = game_state.get_domain_botnet_power() if game_state and hasattr(game_state, "get_domain_botnet_power") else 0
+            if botnet_power > 0:
+                base_damage += botnet_power * 2
+        elif parsed.base_cmd == "sqlmap" and (
+            target_subsystem in {"MEM", "STO"}
+            or enemy.has_db_surface(target_subsystem)
+            or enemy.has_web_surface(target_subsystem)
+        ):
+            base_damage += 2
+            if enemy.has_endpoint_hits(target_subsystem):
+                base_damage += 2
+        elif parsed.base_cmd == "siphon" and (
+            target_subsystem in {"MEM", "STO"} or enemy.has_db_surface(target_subsystem)
+        ):
+            base_damage += 2
+        elif parsed.base_cmd == "overflow" and target_subsystem in {"MEM", "NET"}:
+            base_damage += 2
+        elif parsed.base_cmd == "shred" and target.current_hp <= max(1, target.max_hp // 2):
+            base_damage += 3
+        elif parsed.base_cmd == "spray" and (target_subsystem in {"SEC", "NET"} or enemy.has_auth_surface(target_subsystem)):
+            base_damage += 2
+        elif parsed.base_cmd == "hammer" and target_subsystem == "OS" and enemy.subsystems["SEC"].is_destroyed:
+            base_damage += 2
+
+        if is_weakness:
+            base_damage *= 2
+
+        adaptive_block, adaptive_reasons = enemy.get_adaptive_mitigation(
+            parsed.base_cmd,
+            script_type,
+            target_subsystem,
+            parsed.flags,
+            payload_dna,
+        )
+        timing_bonus = 0
+        fingerprint_bonus = 0
+        adaptive_soften = 0
+        if script_type in {"brute_force", "exploit"} and parsed.base_cmd != "ping" and enemy.get_timing_window(target_subsystem) > 0:
+            timing_bonus = 1
+            adaptive_soften += 1
+            base_damage += timing_bonus
+        if script_type == "exploit" and enemy.get_fingerprint_window(target_subsystem) > 0:
+            fingerprint_bonus = 2
+            adaptive_soften += 2
+            base_damage += fingerprint_bonus
+        if adaptive_soften > 0 and adaptive_block > 0:
+            adaptive_block = max(0, adaptive_block - adaptive_soften)
+        if adaptive_block > 0 and base_damage > 0:
+            base_damage = max(0, base_damage - adaptive_block)
+
+        firewall_absorb = 0
+        if target_subsystem == "OS" and not enemy.subsystems["SEC"].is_destroyed:
+            if base_damage <= 0:
+                os_damage = 0
+                redirected = 0
+            else:
+                os_damage = max(1, base_damage // 3)
+                redirected = max(0, base_damage - os_damage)
+            firewall_absorb = redirected
+            base_damage = os_damage
+
+        return {
+            "parsed": parsed,
+            "script_data": script_data,
+            "script_type": script_type,
+            "target_subsystem": target_subsystem,
+            "target": target,
+            "damage": base_damage,
+            "is_weakness": is_weakness,
+            "adaptive_block": adaptive_block,
+            "adaptive_reasons": adaptive_reasons,
+            "timing_bonus": timing_bonus,
+            "fingerprint_bonus": fingerprint_bonus,
+            "firewall_absorb": firewall_absorb,
+            "payload_dna": payload_dna,
+        }
+
     @staticmethod
     def split_damage_chunks(total_damage: int, hits: int):
         if total_damage <= 0 or hits <= 0:
@@ -153,7 +295,7 @@ class Arsenal:
         random.shuffle(chunks)
         return chunks
 
-    def execute(self, command_str: str, player, enemy, game_state) -> CommandResult:
+    def execute(self, command_str: str, player, enemy, game_state, phase: str = "combat") -> CommandResult:
         try:
             parsed = self.parse_command(command_str, owner=player)
         except ValueError as exc:
@@ -162,7 +304,8 @@ class Arsenal:
         script_data = self.scripts[parsed.base_cmd]
         base_cmd = parsed.base_cmd
         used_flags = parsed.flags
-        target_subsystem = parsed.target_subsystem or "OS"
+        target_subsystem = self.get_resolved_target(parsed) or "OS"
+        payload_dna = self.get_payload_dna(parsed)
 
         if base_cmd == "nmap":
             if target_subsystem not in enemy.subsystems:
@@ -197,26 +340,64 @@ class Arsenal:
             service_summary = enemy.get_service_summary(target_subsystem)
             if target_subsystem == enemy.weakness:
                 enemy.weakness_revealed = True
-                enemy.arm_fingerprint_window(target_subsystem, 2)
                 stealth_line = "         Version probes stayed below the louder detection thresholds.\n" if "--stealth" in used_flags else ""
                 return CommandResult(
                     True,
                     "\033[96mSUCCESS: 'nmap' version detection complete.\n"
                     f"{stealth_line}"
                     f"         [{target_subsystem}] services: {service_summary}.\n"
-                    f"         Fingerprint cache primed on [{target_subsystem}] for cleaner exploit follow-through.\n"
+                    f"         Fingerprint cache primed on [{target_subsystem}] for the next adjacent payload.\n"
                     f"\033[93m         Exposure confirmed on [{target_subsystem}]. Exploit chain integrity is poor there.\033[0m",
                 )
 
-            enemy.arm_fingerprint_window(target_subsystem, 2)
             stealth_line = "         Version probes stayed below the louder detection thresholds.\n" if "--stealth" in used_flags else ""
             return CommandResult(
                 True,
                 "\033[96mSUCCESS: 'nmap' version detection complete.\n"
                 f"{stealth_line}"
                 f"         [{target_subsystem}] services: {service_summary}.\n"
-                f"         Fingerprint cache primed on [{target_subsystem}] for the next exploit window.\n"
+                f"         Fingerprint cache primed on [{target_subsystem}] for the next adjacent exploit window.\n"
                 f"         [{target_subsystem}] is exposed, but no primary weakness fingerprint matched.\033[0m",
+            )
+
+        if base_cmd == "masscan":
+            if not player.can_scan():
+                return CommandResult(False, "Error: NET is offline. Rapid scan traffic is unavailable.")
+            if parsed.has_target:
+                return CommandResult(False, "Error: 'masscan' is a wide scan. Omit '-target'.")
+
+            enemy.topology_revealed = True
+            botnet_power = game_state.get_domain_botnet_power() if game_state and hasattr(game_state, "get_domain_botnet_power") else 0
+            exposed_lanes = []
+            surface_lines = []
+            for entry in enemy.get_ports_for_subsystem():
+                surface_lines.append(
+                    f"         {entry['port']:<8} open  {entry['service']:<12} {entry['banner']} -> [{entry['subsystem']}]"
+                )
+                subsystem_key = entry["subsystem"]
+                if subsystem_key not in exposed_lanes:
+                    exposed_lanes.append(subsystem_key)
+
+            lane_budget = min(len(exposed_lanes), 2 + min(2, botnet_power // 2))
+            primed_lanes = []
+            for subsystem_key in exposed_lanes[:lane_budget]:
+                enemy.arm_timing_window(subsystem_key, 1)
+                primed_lanes.append(subsystem_key)
+
+            notes = []
+            if "--stealth" in used_flags or "--ghost" in used_flags:
+                notes.append("         Low-profile half-open flood stayed beneath the noisier route alarms.")
+            if botnet_power > 0:
+                notes.append(f"         Botnet fanout widened the sweep to {lane_budget} exposed lane(s).")
+            if primed_lanes:
+                notes.append(f"         Timing windows primed on: {', '.join(primed_lanes)}.")
+
+            extra_lines = ("\n".join(notes + surface_lines) + "\n") if (notes or surface_lines) else ""
+            return CommandResult(
+                True,
+                "\033[96mSUCCESS: 'masscan' burst sweep complete.\n"
+                f"{extra_lines}"
+                "         Service spray finished. Port topology surfaced; host identity remains masked.\033[0m",
             )
 
         if base_cmd == "enum":
@@ -425,6 +606,27 @@ class Arsenal:
                 notes.append("         No stale lock or recon residue was present, but route keys were rotated.")
             return CommandResult(True, "\n".join(notes))
 
+        if base_cmd == "jmp":
+            return CommandResult(
+                True,
+                "SUCCESS: Branch shim loaded.\n"
+                "         The live stack controller will swap the next two queued payloads when this directive resolves.",
+            )
+
+        if base_cmd == "stager":
+            return CommandResult(
+                True,
+                f"SUCCESS: Deferred-detonation buffer armed on [{target_subsystem}].\n"
+                "         The next adjacent offensive payload on that lane will be captured instead of landing immediately.",
+            )
+
+        if base_cmd == "buffer":
+            return CommandResult(
+                True,
+                f"SUCCESS: Containment shim armed on [{target_subsystem}].\n"
+                "         The next adjacent offensive payload there will trap any excess damage instead of dumping it all into the hardware.",
+            )
+
         if base_cmd == "airmon-ng":
             if target_subsystem not in enemy.subsystems:
                 return CommandResult(False, f"Error: Target subsystem [{target_subsystem}] does not exist.")
@@ -454,8 +656,11 @@ class Arsenal:
                 if cascade > 0:
                     feedback_lines.append(f"         \033[93m> CASCADE: [{target_subsystem}] collapse jolted Core OS for {cascade}.\033[0m")
 
-            enemy.observe_player_action(parsed, script_data, target_subsystem, success=True)
-            alert_stage = enemy.apply_counterintel_pressure(parsed, script_data, target_subsystem)
+            enemy.observe_player_action(parsed, script_data, target_subsystem, success=True, payload_dna=payload_dna)
+            if "--stealth" in used_flags:
+                enemy.blur_adaptation(1)
+                feedback_lines.append("         \033[92m> STEALTH: Host adaptation caches lost resolution on the masked traffic.\033[0m")
+            alert_stage = enemy.apply_counterintel_pressure(parsed, script_data, target_subsystem, payload_dna=payload_dna)
             if alert_stage == 1:
                 feedback_lines.append("         \033[93m> COUNTER-INTEL: The breach exposed a rough map of your node.\033[0m")
             elif alert_stage == 2:
@@ -466,79 +671,40 @@ class Arsenal:
         if target_subsystem not in enemy.subsystems:
             return CommandResult(False, f"Error: Target subsystem [{target_subsystem}] does not exist.")
 
-        target = enemy.subsystems[target_subsystem]
-        if target.is_destroyed:
-            return CommandResult(False, f"Error: Target [{target_subsystem}] is already offline.")
+        try:
+            profile = self.build_attack_profile(parsed, player, enemy, game_state)
+        except ValueError as exc:
+            return CommandResult(False, str(exc))
 
-        base_damage = script_data.get("damage", 0)
-        script_type = script_data.get("type", "unknown")
-        is_weakness = target_subsystem == enemy.weakness
+        target = profile["target"]
+        target_subsystem = profile["target_subsystem"]
+        script_type = profile["script_type"]
+        base_damage = profile["damage"]
+        is_weakness = profile["is_weakness"]
+        adaptive_block = profile["adaptive_block"]
+        adaptive_reasons = profile["adaptive_reasons"]
+        timing_bonus = profile["timing_bonus"]
+        fingerprint_bonus = profile["fingerprint_bonus"]
+        payload_dna = profile["payload_dna"]
+        firewall_absorb = 0
+        if profile["firewall_absorb"] > 0:
+            firewall_absorb = enemy.subsystems["SEC"].take_damage(profile["firewall_absorb"])
 
-        base_damage += sum(self.flags.get(flag, {}).get("damage_bonus", 0) for flag in used_flags)
-
-        if base_cmd == "ping":
-            if enemy.topology_revealed and not enemy.intent_revealed:
-                enemy.intent_revealed = True
-            if target_subsystem == "NET":
-                base_damage += 1
-        elif base_cmd == "hydra":
-            if enemy.has_auth_surface(target_subsystem):
-                base_damage += 3
-            else:
-                base_damage = max(1, base_damage - 3)
-            if enemy.has_credential_pressure(target_subsystem):
-                base_damage += 2
-        elif base_cmd == "sqlmap" and (
-            target_subsystem in {"MEM", "STO"}
-            or enemy.has_db_surface(target_subsystem)
-            or enemy.has_web_surface(target_subsystem)
-        ):
-            base_damage += 2
-            if enemy.has_endpoint_hits(target_subsystem):
-                base_damage += 2
-        elif base_cmd == "overflow" and target_subsystem in {"MEM", "NET"}:
-            base_damage += 2
-        elif base_cmd == "shred" and target.current_hp <= max(1, target.max_hp // 2):
-            base_damage += 3
-        elif base_cmd == "spray" and (target_subsystem in {"SEC", "NET"} or enemy.has_auth_surface(target_subsystem)):
-            base_damage += 2
-        elif base_cmd == "hammer" and target_subsystem == "OS" and enemy.subsystems["SEC"].is_destroyed:
-            base_damage += 2
-
-        if is_weakness:
-            base_damage *= 2
-
-        adaptive_block, adaptive_reasons = enemy.get_adaptive_mitigation(base_cmd, script_type, target_subsystem, used_flags)
-        timing_bonus = 0
-        fingerprint_bonus = 0
-        adaptive_soften = 0
-        if script_type in {"brute_force", "exploit"} and base_cmd != "ping" and enemy.get_timing_window(target_subsystem) > 0:
-            timing_bonus = 1
-            adaptive_soften += 1
-            base_damage += timing_bonus
-        if script_type == "exploit" and enemy.get_fingerprint_window(target_subsystem) > 0:
-            fingerprint_bonus = 2
-            adaptive_soften += 2
-            base_damage += fingerprint_bonus
-        if adaptive_soften > 0 and adaptive_block > 0:
-            adaptive_block = max(0, adaptive_block - adaptive_soften)
-        if adaptive_block > 0 and base_damage > 0:
-            base_damage = max(0, base_damage - adaptive_block)
-
-        if target_subsystem == "OS" and not enemy.subsystems["SEC"].is_destroyed:
-            if base_damage <= 0:
-                os_damage = 0
-                redirected = 0
-            else:
-                os_damage = max(1, base_damage // 3)
-                redirected = max(0, base_damage - os_damage)
-            firewall_absorb = enemy.subsystems["SEC"].take_damage(redirected)
-            base_damage = os_damage
-        else:
-            firewall_absorb = 0
+        if base_cmd == "ping" and enemy.topology_revealed and not enemy.intent_revealed:
+            enemy.intent_revealed = True
 
         actual_dmg = target.take_damage(base_damage)
         total_damage = actual_dmg
+        overkill_damage = max(0, base_damage - actual_dmg)
+        result_metadata = {
+            "worm_seed": 0,
+            "worm_source": None,
+            "bus_splash_events": 0,
+            "bus_splash_damage": 0,
+            "overkill_damage": overkill_damage,
+            "contained_overkill": 0,
+            "payload_signature": build_payload_signature(payload_dna),
+        }
         feedback_lines = [f"SUCCESS: Executed '{base_cmd}' on [{target_subsystem}]. Dealt {actual_dmg} damage."]
 
         if base_cmd == "ping" and enemy.topology_revealed and enemy.intent_revealed:
@@ -546,9 +712,8 @@ class Arsenal:
                 "         \033[96m> RTT SAMPLE: response timing exposed a cleaner read on the hostile job queue.\033[0m"
             )
         if base_cmd == "ping" and actual_dmg > 0:
-            enemy.arm_timing_window(target_subsystem, 1)
             feedback_lines.append(
-                f"         \033[96m> TIMING MARK: [{target_subsystem}] now has a cleaner follow-up window for the rest of the turn.\033[0m"
+                f"         \033[96m> TIMING MARK: [{target_subsystem}] now has a cleaner adjacent follow-up window.\033[0m"
             )
         if timing_bonus > 0:
             feedback_lines.append(
@@ -584,6 +749,30 @@ class Arsenal:
             for idx, chunk in enumerate(landed, start=1):
                 feedback_lines.append(f"         \033[93m> HYDRA: login burst {idx} landed for {chunk} damage.\033[0m")
 
+        if base_cmd == "ddos":
+            botnet_power = game_state.get_domain_botnet_power() if game_state and hasattr(game_state, "get_domain_botnet_power") else 0
+            feedback_lines[0] = (
+                f"SUCCESS: Executed 'ddos' on [{target_subsystem}]. "
+                f"Flood pressure landed for {actual_dmg} damage."
+            )
+            if target_subsystem in {"NET", "SEC"}:
+                feedback_lines.append(
+                    "         \033[93m> SATURATION LANE: the flood is most effective against routing and perimeter control.\033[0m"
+                )
+            if botnet_power > 0:
+                feedback_lines.append(
+                    f"         \033[96m> BOTNET SCALE: {botnet_power} seeded domain(s) added +{botnet_power * 2} distributed pressure.\033[0m"
+                )
+            else:
+                feedback_lines.append(
+                    "         \033[90m> LOCAL SWARM: no rooted botnet seeds were available, so the flood stayed small.\033[0m"
+                )
+            if target_subsystem == "NET" and actual_dmg > 0:
+                enemy.intent_jam_turns = max(getattr(enemy, "intent_jam_turns", 0), 1)
+                feedback_lines.append(
+                    "         \033[96m> ROUTE CHOKE: uplink congestion may stall the host's next control cycle.\033[0m"
+                )
+
         if base_cmd == "sqlmap" and actual_dmg > 0:
             if enemy.has_endpoint_hits(target_subsystem):
                 feedback_lines.append(
@@ -600,6 +789,19 @@ class Arsenal:
                 feedback_lines.append(
                     "         \033[96m> QUERY FAULT: backend state desynced; the next hostile action is likely to stall.\033[0m"
                 )
+
+        if base_cmd == "siphon" and actual_dmg > 0:
+            siphon_gain = actual_dmg
+            if target_subsystem == "STO":
+                siphon_gain += 3
+            elif target_subsystem == "MEM":
+                siphon_gain += 2
+            if enemy.has_endpoint_hits(target_subsystem):
+                siphon_gain += 1
+            game_state.player_crypto += siphon_gain
+            feedback_lines.append(
+                f"         \033[95m> SIPHON: drained {siphon_gain} Crypto from [{target_subsystem}] service residue.\033[0m"
+            )
 
         if base_cmd == "spray" and target_subsystem == "SEC" and actual_dmg > 0:
             enemy.security_breach_turns = max(enemy.security_breach_turns, 1)
@@ -685,9 +887,43 @@ class Arsenal:
                     f"         \033[93m> FORK: secondary thread clipped [{fork_target}] for {dealt} damage.\033[0m"
                 )
 
+        splash_pressure = 0
+        splash_depth = 1
+        if "--volatile" in used_flags and total_damage > 0:
+            splash_pressure = max(splash_pressure, max(1, total_damage // 2))
+            splash_depth = max(splash_depth, 2)
+        if "--cascade" in used_flags and total_damage > 0:
+            splash_pressure = max(splash_pressure, max(1, total_damage // 2))
+            splash_depth = max(splash_depth, 2)
+        if base_cmd in {"overflow", "hammer"} and total_damage > 0:
+            splash_pressure = max(splash_pressure, max(1, total_damage // 2))
+            splash_depth = max(splash_depth, 2)
+        elif base_cmd == "shred" and target_subsystem in {"MEM", "STO"} and total_damage > 0:
+            splash_pressure = max(splash_pressure, max(1, total_damage // 3))
+
+        if splash_pressure > 0:
+            splash_lines, splash_damage = enemy.apply_bus_splash(
+                target_subsystem,
+                splash_pressure,
+                depth=splash_depth,
+            )
+            if splash_damage > 0:
+                total_damage += splash_damage
+                result_metadata["bus_splash_events"] += 1
+                result_metadata["bus_splash_damage"] += splash_damage
+                feedback_lines.extend(splash_lines)
+
         if "--ransom" in used_flags:
             game_state.player_crypto += total_damage
             feedback_lines.append(f"         \033[95m> RANSOM: monetized {total_damage} points of damage into Crypto.\033[0m")
+
+        if "--worm" in used_flags and total_damage > 0:
+            seed_strength = max(1, (total_damage // 3) + (2 if target.is_destroyed else 0))
+            result_metadata["worm_seed"] = max(result_metadata["worm_seed"], seed_strength)
+            result_metadata["worm_source"] = target_subsystem
+            feedback_lines.append(
+                f"         \033[95m> WORM SEED: residual traffic escaped the node with {seed_strength} route-mesh pressure.\033[0m"
+            )
 
         if "--stealth" not in used_flags and script_type in {"brute_force", "exploit"}:
             noise_amount = max(
@@ -719,11 +955,14 @@ class Arsenal:
                 elif target_subsystem == "SEC":
                     feedback_lines.append("         \033[96m> OPEN CORE: direct access to [OS] is no longer being shunted by perimeter controls.\033[0m")
 
-        enemy.observe_player_action(parsed, script_data, target_subsystem, success=True)
-        alert_stage = enemy.apply_counterintel_pressure(parsed, script_data, target_subsystem)
+        enemy.observe_player_action(parsed, script_data, target_subsystem, success=True, payload_dna=payload_dna)
+        if "--stealth" in used_flags:
+            enemy.blur_adaptation(1)
+            feedback_lines.append("         \033[92m> STEALTH: Host adaptation caches lost resolution on the masked traffic.\033[0m")
+        alert_stage = enemy.apply_counterintel_pressure(parsed, script_data, target_subsystem, payload_dna=payload_dna)
         if alert_stage == 1:
             feedback_lines.append("         \033[93m> COUNTER-INTEL: The host now has a rough map of your node.\033[0m")
         elif alert_stage == 2:
             feedback_lines.append("         \033[91m> COUNTER-INTEL: Signature burned. Expect targeted punishment.\033[0m")
 
-        return CommandResult(True, "\n".join(feedback_lines))
+        return CommandResult(True, "\n".join(feedback_lines), metadata=result_metadata)

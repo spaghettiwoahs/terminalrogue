@@ -35,25 +35,63 @@ def boot_layout_card() -> ObjectiveCard:
 
 def live_grid_card() -> ObjectiveCard:
     return ObjectiveCard(
-        title="CURRENT CONTRACT",
-        body="Type a live IP to route into the node. mail opens the dead-drop inbox. The gatekeeper is always live. Side nodes are optional prep for crypto, repairs, intel, bots, and contracts.",
+        title="ROUTE MESH",
+        body="The mesh is live. Border nodes, rooted shells, and dead drops are updating against the current route state.",
         tone="cyan",
     )
 
 
 def prebreach_recon_card() -> ObjectiveCard:
     return ObjectiveCard(
-        title="PRE-BREACH RECON",
-        body="You have a passive tap on the node. Type engage to breach cold, or recon first and risk giving away your approach.",
+        title="PHASE 1 // RECON",
+        body="Passive tap is live. Scout with scan tools, type soft engage to let the host answer first, or type engage to breach immediately.",
         tone="yellow",
+        command="recon | soft engage | engage",
+        detail="soft engage spends the host's opening response before full combat. It can hurt, but it also exposes live countermeasures, patch posture, and attack lanes.",
+    )
+
+
+def node_tap_card(node_ip: str, alert_text: str = "") -> ObjectiveCard:
+    detail = f"Link state: {alert_text}." if alert_text else ""
+    return ObjectiveCard(
+        title=f"LIVE HOP // {node_ip}",
+        body="You are parked on a live route. Scout from here, commit the breach when ready, or cut away to a different hop.",
+        tone="yellow",
+        detail=detail,
     )
 
 
 def live_combat_card() -> ObjectiveCard:
     return ObjectiveCard(
-        title="LIVE COMBAT",
-        body="You breached the node. Surface it with nmap, scrape exact telemetry with enum, crack SEC, then fingerprint or strike blind.",
+        title="PHASE 2 // ENGAGE",
+        body="The socket is hot now. Build the exploit stack around what recon exposed, then execute the chain in order.",
         tone="yellow",
+        command="queue payloads | execute",
+        detail="Adjacency windows only affect the next slotted payload. Stack order is the whole attack plan.",
+    )
+
+
+def cleanup_card(rooted: bool, forensic_ready: bool = False) -> ObjectiveCard:
+    if rooted:
+        return ObjectiveCard(
+            title="PHASE 3 // CLEANUP",
+            body="The node stayed intact. Loot is already moving. Cool the link, scrub heat, and leave the shell stable before you step back onto the route mesh.",
+            tone="green",
+            command="scrub | status | done",
+            detail="Cleanup is the recovery pass after execution: reduce exposure, confirm what survived, then move on.",
+        )
+    command = "forensics | scrub | status | done" if forensic_ready else "scrub | status | done"
+    detail = (
+        "The hardware is dead. You can still work the crash image for salvage and intel before you walk."
+        if forensic_ready
+        else "The hardware is dead and the residue is already cold. Scrub your trace and move."
+    )
+    return ObjectiveCard(
+        title="PHASE 3 // CLEANUP",
+        body="The node bricked. Data channels collapsed, but crash residue can still pay out if you want to risk working the wreck.",
+        tone="red",
+        command=command,
+        detail=detail,
     )
 
 
@@ -68,10 +106,10 @@ def day_wrap_card(completed_day: int) -> ObjectiveCard:
 def tutorial_bootstrap_card() -> ObjectiveCard:
     return ObjectiveCard(
         title="BOOTSTRAP",
-        body="The tutorial coach will bring the workstation online one panel at a time before the warm-up host starts.",
+        body="Orientation comes first. After that, the tutorial coach will bring the workstation online one panel at a time before the warm-up host starts.",
         tone="cyan",
         command="click through boot coach",
-        detail="Once the panels are live, the first training host will walk you through the current combat loop.",
+        detail="The opening clicks are story and system boot, not combat steps. The first live host starts only after the workstation is online.",
         tutorial=True,
     )
 
@@ -79,10 +117,10 @@ def tutorial_bootstrap_card() -> ObjectiveCard:
 def sandbox_alert_card() -> ObjectiveCard:
     return ObjectiveCard(
         title="SANDBOX ALERT",
-        body="This next fight is less hand-held. The coach stays with you, but the target window matters more than the objective card now.",
+        body="This next fight is less hand-held. The coach stays with you, but route pressure and hostile readback matter more than the objective card now.",
         tone="yellow",
-        command="watch hostile recon",
-        detail="Watch the difference between layout exposure and signature exposure while the responder reads you back.",
+        command="watch route pressure",
+        detail="Trace is your run heat, sweep is local hunt pressure, and BF/EX are the brute-force and exploit noise buckets that describe your style.",
         tutorial=True,
     )
 
@@ -139,7 +177,7 @@ def build_black_ice_tutorial_card(enemy) -> ObjectiveCard:
             body="The responder is probing your layout. Watch the target window and decide whether to poison the read before it finishes.",
             tone="yellow",
             command="honeypot",
-            detail="The coach is backing off now. Read the dossier before you commit.",
+            detail="The coach is backing off now. Read the dossier before you commit, including buses: they are the internal links that let splash and cascades travel between subsystems.",
             tutorial=True,
         )
     if not enemy.player_signature_revealed:
@@ -166,6 +204,26 @@ def prologue_heist_message() -> str:
         "> Something live answered behind the training endpoint.\n"
         "> Instructor telemetry just lost sync.\n"
         "> Proceed carefully.\n"
+    )
+
+
+def lab_orientation_message() -> str:
+    return (
+        "[CIVIC CYBER LAB // ORIENTATION]\n"
+        "> Welcome, newblood.\n"
+        "> This is a cheap neighborhood sandbox, not a black-site war room.\n"
+        "> You are here to learn how hostile systems behave, how not to panic, and how to keep your own box alive.\n"
+        "> Nobody expects you to be a legend. They expect you to pay attention.\n"
+    )
+
+
+def sandbox_rules_message() -> str:
+    return (
+        "[INSTRUCTOR NOTE // LAB RULES]\n"
+        "> Training routes should stay synthetic.\n"
+        "> No public spill. No real operators. No live critical systems.\n"
+        "> If anything outside the lesson starts answering back, close the link and call it in.\n"
+        "> That is the rule. That is always the rule.\n"
     )
 
 
@@ -252,5 +310,31 @@ def dossier_contract_copy(node) -> dict:
             f"{node.ip_address} matters more alive than dead, until it doesn't.\n"
             "I need structure, chatter, and a proper read before you flatten it.\n"
             "Bring me a dossier, then end the host."
+        ),
+    }
+
+
+def capture_contract_copy(node) -> dict:
+    return {
+        "subject": f"Take root on {_brief_for(node)}",
+        "brief": "Control job. Finish cleanly and keep the shell alive.",
+        "condition_text": "Finish with Root Access instead of bricking the node.",
+        "body": (
+            f"{node.ip_address} is more valuable breathing than burning.\n"
+            "I want the shell, the route flags, and whatever infrastructure the chassis can still host.\n"
+            "Keep it intact."
+        ),
+    }
+
+
+def disarm_contract_copy(node) -> dict:
+    return {
+        "subject": f"Strip perimeter on {_brief_for(node)}",
+        "brief": "Disable the perimeter before the kill lands.",
+        "condition_text": "Take [SEC] offline before the node is neutralized.",
+        "body": (
+            f"{node.ip_address} is carrying a perimeter profile I need collapsed.\n"
+            "I do not care who owns the core afterwards.\n"
+            "Break the shell, then finish the host."
         ),
     }

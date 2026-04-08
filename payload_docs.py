@@ -21,15 +21,21 @@ def script_effect_lines(script_id: str, data: dict) -> list[str]:
 
     special = {
         "ping": [
-            "On hit, arms a timing window on the struck subsystem for 1 turn.",
+            "On hit, arms a timing window for the immediately adjacent payload on the struck subsystem.",
             "If topology is known but hostile intent is still hidden, it reveals hostile intent.",
             "Against NET, gains +1 damage.",
+        ],
+        "masscan": [
+            "Untargeted only.",
+            "Reveals open ports and subsystem layout without revealing the full host identity packet.",
+            "Primes timing windows on up to two exposed subsystems.",
+            "Botnet power increases how many lanes can be primed by the sweep.",
         ],
         "nmap": [
             "Untargeted mode reveals host identity, countermeasure, open ports, banners, and subsystem layout.",
             "Targeted mode requires mapped topology.",
             "Targeted mode is blocked while SEC is active unless SEC is destroyed or already breached.",
-            "Successful targeted scans arm a fingerprint window on the chosen subsystem for 2 turns.",
+            "Successful targeted scans arm a fingerprint window for the immediately adjacent payload on the chosen subsystem.",
             "If the chosen subsystem is the hidden weakness, the weakness is revealed.",
         ],
         "enum": [
@@ -57,11 +63,21 @@ def script_effect_lines(script_id: str, data: dict) -> list[str]:
             "Loses 3 damage on non-auth surfaces, to a minimum of 1.",
             "Gains +2 damage on lanes already primed with credential pressure.",
         ],
+        "ddos": [
+            "Gains +2 damage on NET or SEC.",
+            "Scales with your global botnet power.",
+            "Each active Botnet Seed adds +2 damage to every DDoS run.",
+        ],
         "sqlmap": [
             "Gains +2 damage on MEM, STO, database surfaces, or web surfaces.",
             "Gains another +2 damage if endpoint hits are already marked there.",
             "On STO hit, exfiltrates +8 Crypto.",
             "On MEM hit, jams the next hostile action for 1 turn.",
+        ],
+        "siphon": [
+            "Gains +2 damage on STO, MEM, and database-backed surfaces.",
+            "Steals Crypto equal to landed damage plus a small lane bonus.",
+            "Endpoint hits on the chosen subsystem add +1 more stolen Crypto.",
         ],
         "spray": [
             "Gains +2 damage on SEC, NET, or auth surfaces.",
@@ -107,6 +123,21 @@ def script_effect_lines(script_id: str, data: dict) -> list[str]:
             "Repairs the most damaged supporting lane for 2 HP.",
             "Restores 1 RAM if below cap.",
         ],
+        "jmp": [
+            "Swaps the next two queued payloads before they resolve.",
+            "Only affects the immediate local stack window after it.",
+            "Useful for forcing a different adjacency pair without rebuilding the whole stack.",
+        ],
+        "stager": [
+            "Arms a deferred-detonation buffer on the chosen subsystem.",
+            "Only the next adjacent offensive payload on that subsystem can be captured.",
+            "Captured pressure is released on the next later hit against that subsystem.",
+        ],
+        "buffer": [
+            "Arms a containment slot on the chosen subsystem.",
+            "Only the next adjacent offensive payload on that subsystem can use it.",
+            "Any excess damage beyond the subsystem's remaining HP is stored as held pressure instead of landing immediately.",
+        ],
     }
     effects.extend(special.get(script_id, []))
     return effects or ["No additional mechanical effects beyond its baseline class behavior."]
@@ -144,6 +175,10 @@ def flag_effect_lines(flag_id: str, data: dict) -> list[str]:
         "--volatile": [
             "Adds its damage bonus before defenses and reactions are resolved.",
         ],
+        "--cascade": [
+            "Adds an extra bus-splash pass after the main hit resolves.",
+            "Best on dense hosts where connected subsystems are still online.",
+        ],
     }
     effects.extend(special.get(flag_id, []))
     return effects or ["No additional mechanical effects loaded for this modifier."]
@@ -156,7 +191,9 @@ def item_effect_lines(data: dict) -> list[str]:
     turns = data.get("turns", 1)
 
     if effect == "ram":
-        effects.append(f"Restores up to {amount} RAM.")
+        effects.append(f"Adds +{amount} RAM immediately.")
+        effects.append("Any amount above live cap becomes overflow RAM.")
+        effects.append("Unused overflow dissipates after that payload resolves.")
     elif effect == "guard":
         effects.append(f"Adds {amount} guard integrity to the chosen subsystem.")
         effects.append(f"Duration: {turns} turn(s).")

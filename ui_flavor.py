@@ -22,8 +22,8 @@ BOOT_MENU_LABELS = {
     "quit": "power off",
 }
 BOOT_MENU_CONTINUE_STATUS = {
-    True: "save archive detected // continue is available",
-    False: "no save archive detected // start a new session",
+    True: "autosave or named archive detected // continue is available",
+    False: "no autosave or named archive detected // start a new session",
 }
 BOOT_MENU_LOADING_COPY = {
     "1": (
@@ -40,13 +40,144 @@ BOOT_MENU_LOADING_COPY = {
     ),
 }
 
+WINDOW_BOOT_COPY = {
+    "terminal": (
+        "live feed",
+        [
+            ("root@bootstrap:~$ mkdir -p /mnt/runtime/session", "cyan"),
+            ("root@bootstrap:~$ mount /dev/session /mnt/runtime/session", "cyan"),
+            ("root@bootstrap:~$ systemctl start exploit-stackd", "cyan"),
+            ("root@bootstrap:~$ socketctl --prime operator-link", "cyan"),
+            ("root@bootstrap:~$ tail -f /var/log/live_feed", "cyan"),
+        ],
+    ),
+    "log": (
+        "session log",
+        [
+            ("archive@bootstrap:~$ fsck /var/log/session.log", "muted"),
+            ("archive@bootstrap:~$ journalctl --rotate", "muted"),
+            ("archive@bootstrap:~$ journalctl --sync", "muted"),
+            ("archive@bootstrap:~$ remount /var/log read-write", "muted"),
+            ("archive@bootstrap:~$ archivectl --index recent", "muted"),
+        ],
+    ),
+    "objective": (
+        "objective",
+        [
+            ("procfs: probing /proc/objective", "magenta"),
+            ("tracker: attaching mission buffer", "magenta"),
+            ("tracker: indexing active directives", "magenta"),
+            ("tracker: syncing contract overlays", "magenta"),
+            ("tracker: loading route pressure hints", "magenta"),
+        ],
+    ),
+    "databank": (
+        "databank",
+        [
+            ("pkgdb: opening installed payload index", "white"),
+            ("pkgdb: hashing local tool signatures", "white"),
+            ("pkgdb: verifying modifier manifests", "white"),
+            ("pkgdb: mounting operator reference cards", "white"),
+            ("pkgdb: rebuilding local search index", "white"),
+        ],
+    ),
+    "player": (
+        "player",
+        [
+            ("rigd: sampling live subsystem telemetry", "green"),
+            ("rigd: reading ram bus pressure", "green"),
+            ("rigd: binding active defense counters", "green"),
+            ("rigd: verifying consumable inventory", "green"),
+            ("rigd: publishing local operator state", "green"),
+        ],
+    ),
+    "target": (
+        "target",
+        [
+            ("dossier: waiting for hostile profile source", "yellow"),
+            ("dossier: arming service fingerprint cache", "yellow"),
+            ("dossier: preparing subsystem watchlist", "yellow"),
+            ("dossier: loading countermeasure lexicon", "yellow"),
+            ("dossier: standing by for live hostile telemetry", "yellow"),
+        ],
+    ),
+    "route": (
+        "routeweb",
+        [
+            ("netmap: syncing route mesh cache", "accent"),
+            ("netmap: solving outbound adjacency", "accent"),
+            ("netmap: indexing nearby hops", "accent"),
+            ("netmap: annotating border locks", "accent"),
+            ("netmap: plotting local traversal graph", "accent"),
+        ],
+    ),
+}
+
 
 def get_boot_menu_loading_copy(choice: str) -> tuple[str, str]:
     return BOOT_MENU_LOADING_COPY.get(choice, ("starting session", "bringing the workstation online..."))
 
 
+def get_window_boot_sequence(key: str) -> tuple[str, list[tuple[str, str]]]:
+    return WINDOW_BOOT_COPY.get(
+        key,
+        (
+            key,
+            [
+                (f"{key}: initializing runtime surface", "muted"),
+                (f"{key}: loading panel service", "muted"),
+                (f"{key}: binding live session context", "muted"),
+            ],
+        ),
+    )
+
+
+def build_window_boot_snapshot(key: str, stage_index: int) -> list[tuple[str, str]]:
+    label, commands = get_window_boot_sequence(key)
+    visible_command_count = max(0, min(len(commands), stage_index))
+    online = stage_index > len(commands)
+    lines: list[tuple[str, str]] = [
+        (f"[{label}] boot sequence", "magenta"),
+        ("", "text"),
+    ]
+    if visible_command_count == 0:
+        lines.extend(
+            [
+                ("bootstrapping window service...", "muted"),
+                ("allocating viewport buffers...", "muted"),
+            ]
+        )
+    else:
+        lines.extend(commands[:visible_command_count])
+    if online:
+        lines.extend(
+            [
+                ("", "text"),
+                (f"[{label}] online", "green"),
+                ("render pipeline stable // live session attached", "muted"),
+            ]
+        )
+    return lines
+
+
+def build_window_boot_text(key: str, stage_index: int) -> str:
+    return "\n".join(line for line, _tone in build_window_boot_snapshot(key, stage_index))
+
+
 def get_tutorial_boot_steps() -> list[TutorialBootStep]:
     return [
+        TutorialBootStep(
+            focus=None,
+            reveal=None,
+            title="ORIENTATION // civic cyber lab",
+            body="You are newblood: a nobody walking into a cheap community sandbox to learn the basics without setting anything on fire.",
+        ),
+        TutorialBootStep(
+            focus=None,
+            reveal=None,
+            title="ORIENTATION // lab rules",
+            body="The lab is supposed to stay synthetic. No public traffic. No real operators. If anything live answers back, the right move is to cut the link and report it.",
+        ),
         TutorialBootStep(
             focus=None,
             reveal=None,
@@ -76,6 +207,12 @@ def get_tutorial_boot_steps() -> list[TutorialBootStep]:
             reveal="player",
             title="BOOTSTRAP // rig state",
             body="This is your own rig state. RAM, subsystem integrity, active defenses, bots, and carried items live here instead of cluttering the shell.",
+        ),
+        TutorialBootStep(
+            focus=None,
+            reveal=None,
+            title="BOOTSTRAP // session telemetry",
+            body="The top bar is your run telemetry. wallet is your Crypto. trace is your current run heat. sweep is the subnet's active search pressure. Later, the route shell also shows BF and EX: brute-force noise and exploit noise, the two noise ledgers that describe how loud your style has been.",
         ),
         TutorialBootStep(
             focus="databank",
@@ -307,10 +444,13 @@ def sandbox_alert_overlay() -> tuple[str, set[str]]:
                 "",
                 "NEXT LESSON",
                 " The next fight is less scripted.",
-                " You still get warnings, but now you need to read the target panel for yourself.",
+                " TRACE = your run-wide heat.",
+                " SWEEP = the subnet's current hunt pressure.",
+                " BF / EX = brute-force noise and exploit noise.",
+                " Those noise buckets show the style the network thinks you are using.",
             ]
         ),
-        {"target"},
+        {"route"},
     )
 
 
@@ -323,6 +463,8 @@ def black_ice_overlay() -> tuple[str, set[str]]:
                 "READ THE TARGET WINDOW",
                 " LINK   = how hot the breach is.",
                 " INTENT = their next move once you reveal it.",
+                " BUSES  = the internal links between subsystems.",
+                "          hard crashes and splash can travel across those links.",
                 "",
                 " The coach is lighter here on purpose.",
                 " Read the dossier first, then use the shell.",

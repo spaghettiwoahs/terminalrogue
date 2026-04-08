@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import builtins
+import math
 import os
 import re
 import shlex
 import sys
 import threading
+from time import monotonic
 from datetime import datetime
 
 from PySide6.QtCore import QEvent, QPoint, QRect, QTimer, Qt, Signal
@@ -17,6 +19,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QLinearGradient,
     QPainter,
+    QPainterPath,
     QPen,
     QSyntaxHighlighter,
     QTextCharFormat,
@@ -31,10 +34,12 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -53,10 +58,13 @@ from ui_flavor import (
     build_boot_tutorial_overlay,
     build_drone_tutorial_overlay,
     build_warmup_gate_overlay,
+    build_window_boot_snapshot,
+    build_window_boot_text,
     databank_staging_text,
     dev_console_banner_lines,
     get_boot_menu_loading_copy,
     get_tutorial_boot_steps,
+    get_window_boot_sequence,
     isolated_route_text,
     log_staging_text,
     objective_staging_text,
@@ -397,6 +405,903 @@ class TutorialPane(TerminalPane):
         return super().eventFilter(obj, event)
 
 
+class RouteMapCanvas(QWidget):
+    def __init__(self, label_provider, status_provider, intel_provider):
+        super().__init__()
+        self.label_provider = label_provider
+        self.status_provider = status_provider
+        self.intel_provider = intel_provider
+        self.world = None
+        self.cleared_nodes: set[int] = set()
+        self.active_index: int | None = None
+        self.status_text = ""
+        self.staging = False
+        self.staging_text = ""
+        self.node_regions: dict[int, QRect] = {}
+        self.pan_offset = QPoint(0, 0)
+        self._dragging = False
+        self._drag_origin = QPoint()
+        self._drag_start_offset = QPoint()
+        self._layout_cache_key = None
+        self._layout_cache = None
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setObjectName("routeCanvas")
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def set_network_state(
+        self,
+        world,
+        cleared_nodes,
+        active_index,
+        status_text,
+        *,
+        staging: bool = False,
+        staging_text: str = "",
+    ):
+        world_changed = world is not self.world
+        active_changed = active_index != self.active_index
+        self.world = world
+        self.cleared_nodes = set(cleared_nodes or set())
+        self.active_index = active_index
+        self.status_text = status_text or ""
+        self.staging = staging
+        self.staging_text = staging_text
+        self.node_regions = {}
+        self._layout_cache_key = None
+        self._layout_cache = None
+        if world_changed or active_changed:
+            self.pan_offset = QPoint(0, 0)
+        self.update()
+
+    def _combined_links(self, node_index: int) -> list[int]:
+        if not self.world:
+            return []
+        neighbors = set(self.world.get_inbound_hops(node_index))
+        neighbors.update(self.world.get_outbound_hops(node_index))
+        return sorted(neighbors)
+
+    def _focus_index(self) -> int | None:
+        if not self.world or not getattr(self.world, "nodes", None):
+            return None
+        if self.active_index is not None and 0 <= self.active_index < len(self.world.nodes):
+            return self.active_index
+        if self.world.entry_links:
+            return min(self.world.entry_links)
+        return 0
+
+    def _build_tree(self, focus_index: int):
+        distances = {focus_index: 0}
+        parent: dict[int, int | None] = {focus_index: None}
+        queue = [focus_index]
+
+        while queue:
+            current = queue.pop(0)
+            for neighbor in self._combined_links(current):
+                if neighbor in distances:
+                    continue
+                distances[neighbor] = distances[current] + 1
+                parent[neighbor] = current
+                queue.append(neighbor)
+
+        children: dict[int, list[int]] = {index: [] for index in distances}
+        for node_index, parent_index in parent.items():
+            if parent_index is None:
+                continue
+            children.setdefault(parent_index, []).append(node_index)
+
+        for node_index in children:
+            children[node_index].sort(
+                key=lambda idx: (
+                    self.world.node_depths.get(idx, 99),
+                    self.label_provider(self.world, idx, self.world.nodes[idx]).lower(),
+                )
+            )
+        return distances, parent, children
+
+    def _build_component(self, root_index: int, allowed_nodes: set[int] | None = None):
+        distances = {root_index: 0}
+        parent: dict[int, int | None] = {root_index: None}
+        queue = [root_index]
+
+        while queue:
+            current = queue.pop(0)
+            for neighbor in self._combined_links(current):
+                if allowed_nodes is not None and neighbor not in allowed_nodes:
+                    continue
+                if neighbor in distances:
+                    continue
+                distances[neighbor] = distances[current] + 1
+                parent[neighbor] = current
+                queue.append(neighbor)
+
+        children: dict[int, list[int]] = {index: [] for index in distances}
+        for node_index, parent_index in parent.items():
+            if parent_index is None:
+                continue
+            children.setdefault(parent_index, []).append(node_index)
+
+        for node_index in children:
+            children[node_index].sort(
+                key=lambda idx: (
+                    self.world.node_depths.get(idx, 99),
+                    self.label_provider(self.world, idx, self.world.nodes[idx]).lower(),
+                )
+            )
+        return distances, parent, children
+
+    def _edge_pairs(self, node_indexes: set[int]) -> list[tuple[int, int]]:
+        if not self.world:
+            return []
+        edges: set[tuple[int, int]] = set()
+        for source_index, linked in getattr(self.world, "forward_links", {}).items():
+            if source_index not in node_indexes:
+                continue
+            for target_index in linked:
+                if target_index in node_indexes:
+                    edges.add((source_index, target_index))
+        return sorted(edges)
+
+    def _graph_signature(self) -> tuple:
+        if not self.world:
+            return ()
+        forward_links = getattr(self.world, "forward_links", {})
+        edge_signature = tuple(
+            sorted((source, tuple(sorted(targets))) for source, targets in forward_links.items())
+        )
+        depth_signature = tuple(sorted(getattr(self.world, "node_depths", {}).items()))
+        return (
+            id(self.world),
+            len(getattr(self.world, "nodes", [])),
+            edge_signature,
+            depth_signature,
+        )
+
+    @staticmethod
+    def _normalize_angle(angle: float) -> float:
+        while angle > math.pi:
+            angle -= math.tau
+        while angle < -math.pi:
+            angle += math.tau
+        return angle
+
+    def _layout_radial_component(
+        self,
+        *,
+        center_x: float,
+        center_y: float,
+        root_index: int,
+        distances: dict[int, int],
+        children: dict[int, list[int]],
+        ring_step: float,
+        anchor_angle: float,
+    ) -> tuple[dict[int, list[float]], dict[int, float]]:
+        positions_float: dict[int, list[float]] = {root_index: [center_x, center_y]}
+        anchor_angles: dict[int, float] = {root_index: anchor_angle}
+
+        def stable_jitter(node_index: int) -> float:
+            return ((((node_index * 37) % 17) / 16.0) - 0.5) * 0.32
+
+        def orbit_scale(node_index: int) -> float:
+            return 1.0 + ((((node_index * 19) % 9) - 4) * 0.03)
+
+        def assign_children(node_index: int, parent_angle: float, inherited_span: float):
+            child_nodes = children.get(node_index, [])
+            if not child_nodes:
+                return
+
+            child_count = len(child_nodes)
+            if node_index == root_index:
+                span = min(math.tau * 0.9, 1.9 + child_count * 0.42)
+            else:
+                span = min(math.pi * 1.3, max(0.92, inherited_span * 0.8 + child_count * 0.12))
+
+            for order, child_index in enumerate(child_nodes):
+                distance = max(1, distances.get(child_index, 1))
+                if child_count == 1:
+                    swing = 0.7 + 0.12 * ((distance + child_index) % 4)
+                    direction = -1.0 if (child_index + distance) % 2 else 1.0
+                    angle = self._normalize_angle(parent_angle + direction * swing + stable_jitter(child_index))
+                else:
+                    relative = ((order + 0.5) / child_count) - 0.5
+                    angle = self._normalize_angle(parent_angle + relative * span + stable_jitter(child_index))
+
+                radius = ring_step * distance * orbit_scale(child_index)
+                positions_float[child_index] = [
+                    center_x + math.cos(angle) * radius,
+                    center_y + math.sin(angle) * radius,
+                ]
+                anchor_angles[child_index] = angle
+                assign_children(child_index, angle, span)
+
+        assign_children(root_index, anchor_angle, math.pi * 1.2)
+        return positions_float, anchor_angles
+
+    def _layout_positions(self, rect: QRect):
+        focus_index = self._focus_index()
+        if focus_index is None:
+            return None, {}, {}
+
+        distances, _parent, children = self._build_tree(focus_index)
+        graph_signature = self._graph_signature()
+        cache_key = (rect.width(), rect.height(), focus_index, graph_signature)
+        if self._layout_cache_key == cache_key and self._layout_cache is not None:
+            return self._layout_cache
+
+        max_distance = max(distances.values(), default=0)
+        center_x = float(rect.center().x())
+        center_y = float(rect.center().y()) + 8.0
+        margin_x = 66.0
+        margin_y = 34.0
+        min_x = rect.left() + margin_x + 8.0
+        max_x = rect.right() - margin_x - 8.0
+        min_y = rect.top() + margin_y + 8.0
+        max_y = rect.bottom() - margin_y - 8.0
+        focus_fit_radius = max(
+            96.0,
+            min(
+                center_x - min_x,
+                max_x - center_x,
+                center_y - min_y,
+                max_y - center_y,
+            ),
+        )
+        preferred_radius = max(156.0, min(rect.width(), rect.height()) * 0.5)
+        usable_radius = min(preferred_radius, focus_fit_radius)
+        ring_step = usable_radius / max(1, max_distance)
+        positions_float, anchor_angles = self._layout_radial_component(
+            center_x=center_x,
+            center_y=center_y,
+            root_index=focus_index,
+            distances=distances,
+            children=children,
+            ring_step=ring_step,
+            anchor_angle=-math.pi / 2,
+        )
+
+        all_node_indexes = set(range(len(self.world.nodes)))
+        connected_indexes = set(distances)
+        remaining_indexes = all_node_indexes - connected_indexes
+
+        if remaining_indexes:
+            component_centers = [
+                5 * math.pi / 6,
+                math.pi,
+                -5 * math.pi / 6,
+                math.pi / 2,
+                -math.pi / 2,
+                math.pi / 6,
+                -math.pi / 6,
+            ]
+            components: list[set[int]] = []
+            unseen = set(remaining_indexes)
+            while unseen:
+                component_root = min(unseen, key=lambda idx: (self.world.node_depths.get(idx, 99), idx))
+                component_distances, _component_parent, _component_children = self._build_component(component_root, unseen)
+                component_nodes = set(component_distances)
+                components.append(component_nodes)
+                unseen -= component_nodes
+
+            for component_order, component_nodes in enumerate(components):
+                component_root = min(component_nodes, key=lambda idx: (self.world.node_depths.get(idx, 99), idx))
+                component_distances, _component_parent, component_children = self._build_component(component_root, component_nodes)
+                anchor = component_centers[component_order % len(component_centers)]
+                component_center_radius = usable_radius * (0.86 if len(components) == 1 else 0.94)
+                component_center_x = center_x + math.cos(anchor) * component_center_radius
+                component_center_y = center_y + math.sin(anchor) * component_center_radius
+                component_max_distance = max(component_distances.values(), default=1)
+                component_fit_radius = max(
+                    72.0,
+                    min(
+                        component_center_x - min_x,
+                        max_x - component_center_x,
+                        component_center_y - min_y,
+                        max_y - component_center_y,
+                    ),
+                )
+                component_ring_step = min(max(72.0, ring_step * 0.72), component_fit_radius / max(1, component_max_distance))
+                component_positions, component_angles = self._layout_radial_component(
+                    center_x=component_center_x,
+                    center_y=component_center_y,
+                    root_index=component_root,
+                    distances=component_distances,
+                    children=component_children,
+                    ring_step=component_ring_step,
+                    anchor_angle=anchor,
+                )
+                positions_float.update(component_positions)
+                anchor_angles.update(component_angles)
+
+        approx_node_w = max(92.0, min(134.0, rect.width() / 3.0))
+        approx_node_h = 42.0
+        node_indexes = all_node_indexes
+        distance_guides = {
+            node_index: distances.get(node_index, max(1, self.world.node_depths.get(node_index, 1)))
+            for node_index in node_indexes
+        }
+        edges = self._edge_pairs(node_indexes)
+        desired_separation = max(118.0, min(186.0, rect.width() * 0.22))
+
+        for _ in range(90):
+            forces = {node_index: [0.0, 0.0] for node_index in node_indexes}
+
+            node_list = list(node_indexes)
+            for index, node_a in enumerate(node_list):
+                ax, ay = positions_float[node_a]
+                for node_b in node_list[index + 1 :]:
+                    bx, by = positions_float[node_b]
+                    dx = ax - bx
+                    dy = ay - by
+                    distance = math.hypot(dx, dy)
+                    if distance < 0.001:
+                        distance = 0.001
+                        dx = 0.001
+                    repel = min(2400.0, (desired_separation * desired_separation) / distance)
+                    if distance < desired_separation:
+                        repel *= 1.8
+                    nx = dx / distance
+                    ny = dy / distance
+                    forces[node_a][0] += nx * repel
+                    forces[node_a][1] += ny * repel
+                    forces[node_b][0] -= nx * repel
+                    forces[node_b][1] -= ny * repel
+
+            for source_index, target_index in edges:
+                sx, sy = positions_float[source_index]
+                tx, ty = positions_float[target_index]
+                dx = tx - sx
+                dy = ty - sy
+                distance = math.hypot(dx, dy)
+                if distance < 0.001:
+                    continue
+                depth_gap = max(1, abs(distances.get(target_index, 1) - distances.get(source_index, 1)))
+                preferred_length = ring_step * max(0.92, depth_gap)
+                stretch = (distance - preferred_length) * 0.12
+                nx = dx / distance
+                ny = dy / distance
+                forces[source_index][0] += nx * stretch
+                forces[source_index][1] += ny * stretch
+                forces[target_index][0] -= nx * stretch
+                forces[target_index][1] -= ny * stretch
+
+            for node_index in node_indexes:
+                if node_index == focus_index:
+                    positions_float[node_index] = [center_x, center_y]
+                    continue
+
+                px, py = positions_float[node_index]
+                rx = px - center_x
+                ry = py - center_y
+                radius = math.hypot(rx, ry)
+                if radius < 0.001:
+                    rx = 0.001
+                    radius = 0.001
+                desired_radius = ring_step * distance_guides[node_index]
+                radial_pull = (desired_radius - radius) * 0.14
+                forces[node_index][0] += (rx / radius) * radial_pull
+                forces[node_index][1] += (ry / radius) * radial_pull
+
+                current_angle = math.atan2(ry, rx)
+                target_angle = anchor_angles.get(node_index, current_angle)
+                angle_delta = self._normalize_angle(target_angle - current_angle)
+                tangent_x = -math.sin(current_angle)
+                tangent_y = math.cos(current_angle)
+                tangential_pull = angle_delta * max(desired_radius, 32.0) * 0.28
+                forces[node_index][0] += tangent_x * tangential_pull
+                forces[node_index][1] += tangent_y * tangential_pull
+
+            for node_index in node_indexes:
+                if node_index == focus_index:
+                    continue
+                fx, fy = forces[node_index]
+                positions_float[node_index][0] += fx * 0.0024
+                positions_float[node_index][1] += fy * 0.0024
+
+        min_x = rect.left() + max(margin_x, approx_node_w / 2.0) + 8.0
+        max_x = rect.right() - max(margin_x, approx_node_w / 2.0) - 8.0
+        min_y = rect.top() + max(margin_y, approx_node_h / 2.0) + 8.0
+        max_y = rect.bottom() - max(margin_y, approx_node_h / 2.0) - 8.0
+
+        for _ in range(80):
+            moved = False
+            for node_a in sorted(node_indexes):
+                if node_a == focus_index:
+                    continue
+                ax, ay = positions_float[node_a]
+                for node_b in sorted(node_indexes):
+                    if node_b <= node_a:
+                        continue
+                    bx, by = positions_float[node_b]
+                    overlap_x = (approx_node_w + 14.0) - abs(ax - bx)
+                    overlap_y = (approx_node_h + 10.0) - abs(ay - by)
+                    if overlap_x <= 0 or overlap_y <= 0:
+                        continue
+
+                    moved = True
+                    push_x = overlap_x / 2.0 + 1.0
+                    push_y = overlap_y / 2.0 + 1.0
+
+                    if overlap_x < overlap_y:
+                        if ax <= bx:
+                            delta_ax = -push_x
+                            delta_bx = push_x
+                        else:
+                            delta_ax = push_x
+                            delta_bx = -push_x
+                        delta_ay = 0.0
+                        delta_by = 0.0
+                    else:
+                        if ay <= by:
+                            delta_ay = -push_y
+                            delta_by = push_y
+                        else:
+                            delta_ay = push_y
+                            delta_by = -push_y
+                        delta_ax = 0.0
+                        delta_bx = 0.0
+
+                    if node_a != focus_index:
+                        positions_float[node_a][0] = min(max_x, max(min_x, positions_float[node_a][0] + delta_ax))
+                        positions_float[node_a][1] = min(max_y, max(min_y, positions_float[node_a][1] + delta_ay))
+                    if node_b != focus_index:
+                        positions_float[node_b][0] = min(max_x, max(min_x, positions_float[node_b][0] + delta_bx))
+                        positions_float[node_b][1] = min(max_y, max(min_y, positions_float[node_b][1] + delta_by))
+            if not moved:
+                break
+
+        for node_index in node_indexes:
+            if node_index == focus_index:
+                positions_float[node_index] = [center_x, center_y]
+                continue
+            positions_float[node_index][0] = min(max_x, max(min_x, positions_float[node_index][0]))
+            positions_float[node_index][1] = min(max_y, max(min_y, positions_float[node_index][1]))
+
+        positions: dict[int, QPoint] = {}
+        for node_index, (x_pos, y_pos) in positions_float.items():
+            x_pos = max(rect.left() + margin_x, min(int(round(x_pos)), rect.right() - margin_x))
+            y_pos = max(rect.top() + margin_y, min(int(round(y_pos)), rect.bottom() - margin_y))
+            positions[node_index] = QPoint(x_pos, y_pos)
+
+        min_center_x = int(rect.left() + max(margin_x, approx_node_w / 2.0) + 8.0)
+        max_center_x = int(rect.right() - max(margin_x, approx_node_w / 2.0) - 8.0)
+        min_center_y = int(rect.top() + max(margin_y, approx_node_h / 2.0) + 8.0)
+        max_center_y = int(rect.bottom() - max(margin_y, approx_node_h / 2.0) - 8.0)
+        required_gap_x = int(approx_node_w) + 10
+        required_gap_y = int(approx_node_h) + 8
+
+        for _ in range(80):
+            moved = False
+            for node_a in sorted(positions):
+                for node_b in sorted(positions):
+                    if node_b <= node_a:
+                        continue
+                    point_a = positions[node_a]
+                    point_b = positions[node_b]
+                    delta_x = point_b.x() - point_a.x()
+                    delta_y = point_b.y() - point_a.y()
+                    overlap_x = required_gap_x - abs(delta_x)
+                    overlap_y = required_gap_y - abs(delta_y)
+                    if overlap_x <= 0 or overlap_y <= 0:
+                        continue
+
+                    moved = True
+                    move_axis = "x" if overlap_x <= overlap_y else "y"
+                    if move_axis == "x":
+                        push = overlap_x // 2 + 1
+                        if delta_x >= 0:
+                            left_push = -push
+                            right_push = push
+                        else:
+                            left_push = push
+                            right_push = -push
+                        if node_a != focus_index:
+                            point_a.setX(max(min_center_x, min(max_center_x, point_a.x() + left_push)))
+                        if node_b != focus_index:
+                            point_b.setX(max(min_center_x, min(max_center_x, point_b.x() + right_push)))
+                    else:
+                        push = overlap_y // 2 + 1
+                        if delta_y >= 0:
+                            up_push = -push
+                            down_push = push
+                        else:
+                            up_push = push
+                            down_push = -push
+                        if node_a != focus_index:
+                            point_a.setY(max(min_center_y, min(max_center_y, point_a.y() + up_push)))
+                        if node_b != focus_index:
+                            point_b.setY(max(min_center_y, min(max_center_y, point_b.y() + down_push)))
+
+                        if point_a.y() == point_b.y():
+                            side_push = overlap_x // 2 + 1
+                            if node_a != focus_index:
+                                point_a.setX(max(min_center_x, min(max_center_x, point_a.x() - side_push)))
+                            if node_b != focus_index:
+                                point_b.setX(max(min_center_x, min(max_center_x, point_b.x() + side_push)))
+            if not moved:
+                break
+
+        result = (focus_index, positions, distances)
+        self._layout_cache_key = cache_key
+        self._layout_cache = result
+        return result
+
+    def _node_style(self, node_index: int, node):
+        status = self.status_provider(node_index, node, self.cleared_nodes)
+        if node_index == self._focus_index():
+            return QColor(PALETTE["cyan"]), QColor(PALETTE["accent_soft"]), QColor(PALETTE["white"]), status
+        if status == "CONTESTED":
+            return QColor(PALETTE["yellow"]), QColor(60, 42, 18, 220), QColor(PALETTE["white"]), status
+        if status == "FORENSIC":
+            return QColor(PALETTE["magenta"]), QColor(45, 24, 52, 220), QColor(PALETTE["white"]), status
+        if status == "INFECTED":
+            return QColor(PALETTE["red"]), QColor(40, 18, 34, 220), QColor(PALETTE["white"]), status
+        if status == "LOCKDOWN":
+            return QColor(PALETTE["yellow"]), QColor(52, 44, 18, 220), QColor(PALETTE["white"]), status
+        if status == "ROOTED":
+            return QColor(PALETTE["green"]), QColor(18, 40, 28, 220), QColor(PALETTE["white"]), status
+        if status == "BRICKED":
+            return QColor(PALETTE["red"]), QColor(44, 20, 24, 220), QColor(PALETTE["white"]), status
+        if node_index in self.cleared_nodes:
+            return QColor(PALETTE["green"]), QColor(18, 40, 28, 220), QColor(PALETTE["white"]), status
+        if status == "LOCKED":
+            return QColor(PALETTE["muted"]), QColor(24, 28, 38, 215), QColor(PALETTE["muted"]), status
+        if node.node_type == "shop":
+            return QColor(PALETTE["yellow"]), QColor(54, 39, 17, 210), QColor(PALETTE["white"]), status
+        if node.node_type == "gatekeeper":
+            return QColor(PALETTE["red"]), QColor(50, 19, 24, 220), QColor(PALETTE["white"]), status
+        return QColor(PALETTE["accent"]), QColor(20, 28, 42, 220), QColor(PALETTE["text"]), status
+
+    def _tooltip_for_node(self, node_index: int) -> str:
+        if not self.world:
+            return ""
+        node = self.world.nodes[node_index]
+        status = self.status_provider(node_index, node, self.cleared_nodes)
+        label = self.label_provider(self.world, node_index, node)
+        intel = self.intel_provider(node)
+        lines = [
+            f"{label}",
+            f"ip: {node.ip_address}",
+            f"status: {status}",
+            f"depth: {self.world.node_depths.get(node_index, 1)}",
+        ]
+        if intel:
+            lines.append(intel)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _edge_anchor(center: QPoint, other: QPoint, rect: QRect) -> QPoint:
+        dx = other.x() - center.x()
+        dy = other.y() - center.y()
+        if abs(dx) >= abs(dy):
+            return QPoint(rect.right() if dx >= 0 else rect.left(), center.y())
+        return QPoint(center.x(), rect.bottom() if dy >= 0 else rect.top())
+
+    @staticmethod
+    def _compress_path_points(points: list[QPoint]) -> list[QPoint]:
+        if not points:
+            return []
+        compressed = [points[0]]
+        for point in points[1:]:
+            if point == compressed[-1]:
+                continue
+            compressed.append(point)
+
+        simplified = [compressed[0]]
+        for point in compressed[1:]:
+            if len(simplified) < 2:
+                simplified.append(point)
+                continue
+            prev = simplified[-2]
+            current = simplified[-1]
+            if (prev.x() == current.x() == point.x()) or (prev.y() == current.y() == point.y()):
+                simplified[-1] = point
+            else:
+                simplified.append(point)
+        return simplified
+
+    @staticmethod
+    def _segment_hits_rect(start: QPoint, end: QPoint, rect: QRect, padding: int = 10) -> bool:
+        padded = rect.adjusted(-padding, -padding, padding, padding)
+        if start.x() == end.x():
+            x_pos = start.x()
+            top = min(start.y(), end.y())
+            bottom = max(start.y(), end.y())
+            return (
+                padded.left() <= x_pos <= padded.right()
+                and max(top, padded.top()) <= min(bottom, padded.bottom())
+            )
+        if start.y() == end.y():
+            y_pos = start.y()
+            left = min(start.x(), end.x())
+            right = max(start.x(), end.x())
+            return (
+                padded.top() <= y_pos <= padded.bottom()
+                and max(left, padded.left()) <= min(right, padded.right())
+            )
+        return padded.contains(start) or padded.contains(end)
+
+    def _path_block_count(self, points: list[QPoint], blocker_rects: list[QRect]) -> int:
+        count = 0
+        for start, end in zip(points, points[1:]):
+            for rect in blocker_rects:
+                if self._segment_hits_rect(start, end, rect):
+                    count += 1
+        return count
+
+    @staticmethod
+    def _path_length(points: list[QPoint]) -> int:
+        return sum(abs(end.x() - start.x()) + abs(end.y() - start.y()) for start, end in zip(points, points[1:]))
+
+    def _sample_quadratic_curve(self, start: QPoint, control: QPoint, end: QPoint, *, steps: int = 18) -> list[QPoint]:
+        samples: list[QPoint] = []
+        for step in range(steps + 1):
+            t = step / steps
+            inv = 1.0 - t
+            x_pos = inv * inv * start.x() + 2.0 * inv * t * control.x() + t * t * end.x()
+            y_pos = inv * inv * start.y() + 2.0 * inv * t * control.y() + t * t * end.y()
+            samples.append(QPoint(int(round(x_pos)), int(round(y_pos))))
+        return self._compress_path_points(samples)
+
+    def _build_link_curve(
+        self,
+        start: QPoint,
+        end: QPoint,
+        blocker_rects: list[QRect],
+        map_rect: QRect,
+    ) -> tuple[QPoint, list[QPoint]]:
+        nearby_rects = [
+            rect
+            for rect in blocker_rects
+            if rect.intersects(
+                QRect(
+                    min(start.x(), end.x()) - 48,
+                    min(start.y(), end.y()) - 48,
+                    abs(end.x() - start.x()) + 96,
+                    abs(end.y() - start.y()) + 96,
+                )
+            )
+        ]
+
+        mid_x = (start.x() + end.x()) / 2.0
+        mid_y = (start.y() + end.y()) / 2.0
+        dx = end.x() - start.x()
+        dy = end.y() - start.y()
+        length = max(1.0, math.hypot(dx, dy))
+        perp_x = -dy / length
+        perp_y = dx / length
+        amplitude = min(108.0, max(36.0, length * 0.32))
+
+        candidate_controls = [
+            QPoint(int(round(mid_x)), int(round(mid_y))),
+            QPoint(int(round(mid_x + perp_x * amplitude)), int(round(mid_y + perp_y * amplitude))),
+            QPoint(int(round(mid_x - perp_x * amplitude)), int(round(mid_y - perp_y * amplitude))),
+            QPoint(int(round(mid_x + perp_x * amplitude * 1.5)), int(round(mid_y + perp_y * amplitude * 1.5))),
+            QPoint(int(round(mid_x - perp_x * amplitude * 1.5)), int(round(mid_y - perp_y * amplitude * 1.5))),
+        ]
+
+        best_control = candidate_controls[0]
+        best_samples = self._sample_quadratic_curve(start, best_control, end)
+        best_score = None
+        for control in candidate_controls:
+            control = QPoint(
+                max(map_rect.left() + 10, min(map_rect.right() - 10, control.x())),
+                max(map_rect.top() + 10, min(map_rect.bottom() - 10, control.y())),
+            )
+            path = self._sample_quadratic_curve(start, control, end)
+            score = (
+                self._path_block_count(path, nearby_rects),
+                self._path_length(path),
+                abs(control.x() - int(round(mid_x))) + abs(control.y() - int(round(mid_y))),
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_control = control
+                best_samples = path
+        return best_control, best_samples
+
+    def resizeEvent(self, event):
+        self._layout_cache_key = None
+        self._layout_cache = None
+        super().resizeEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._drag_origin = event.position().toPoint()
+            self._drag_start_offset = QPoint(self.pan_offset)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            QToolTip.hideText()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            delta = event.position().toPoint() - self._drag_origin
+            self.pan_offset = self._drag_start_offset + delta
+            self.update()
+            event.accept()
+            return
+        for node_index, rect in self.node_regions.items():
+            if rect.contains(event.pos()):
+                QToolTip.showText(event.globalPosition().toPoint(), self._tooltip_for_node(node_index), self)
+                return
+        QToolTip.hideText()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging and event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.pan_offset = QPoint(0, 0)
+            self.update()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def leaveEvent(self, event):
+        QToolTip.hideText()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor(PALETTE["terminal"]))
+
+        header_rect = self.rect().adjusted(8, 6, -8, -8)
+        painter.setPen(QColor(PALETTE["muted"]))
+        painter.drawText(header_rect.adjusted(0, 0, 0, -header_rect.height() + 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.status_text[:72])
+
+        map_rect = self.rect().adjusted(8, 30, -8, -8)
+        self.node_regions = {}
+
+        if self.staging:
+            painter.setPen(QColor(PALETTE["muted"]))
+            painter.drawText(map_rect, Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap, self.staging_text or route_staging_text())
+            return
+
+        if not self.world or not getattr(self.world, "nodes", None):
+            painter.setPen(QColor(PALETTE["muted"]))
+            painter.drawText(map_rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, "> awaiting route mesh...")
+            return
+
+        focus_index, positions, distances = self._layout_positions(map_rect)
+        if focus_index is None:
+            painter.setPen(QColor(PALETTE["muted"]))
+            painter.drawText(map_rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, "route graph unavailable")
+            return
+
+        node_width = max(92, min(134, map_rect.width() // 3))
+        node_height = 42
+        panned_positions = {
+            node_index: QPoint(point.x() + self.pan_offset.x(), point.y() + self.pan_offset.y())
+            for node_index, point in positions.items()
+        }
+        node_rects = {
+            node_index: QRect(
+                center.x() - node_width // 2,
+                center.y() - node_height // 2,
+                node_width,
+                node_height,
+            )
+            for node_index, center in panned_positions.items()
+        }
+
+        for source_index, linked in getattr(self.world, "forward_links", {}).items():
+            if source_index not in panned_positions:
+                continue
+            for target_index in linked:
+                if target_index not in panned_positions:
+                    continue
+                start_center = panned_positions[source_index]
+                end_center = panned_positions[target_index]
+                start_rect = node_rects[source_index]
+                end_rect = node_rects[target_index]
+                start = self._edge_anchor(start_center, end_center, start_rect)
+                end = self._edge_anchor(end_center, start_center, end_rect)
+                blocker_rects = [
+                    rect
+                    for node_index, rect in node_rects.items()
+                    if node_index not in {source_index, target_index}
+                ]
+                control_point, sampled_points = self._build_link_curve(start, end, blocker_rects, map_rect)
+                target_node = self.world.nodes[target_index]
+                target_status = self.status_provider(target_index, target_node, self.cleared_nodes)
+                line_color = QColor(PALETTE["green"] if source_index in self.cleared_nodes else PALETTE["panel_border"])
+                line_pen = QPen(line_color, 1.5)
+                if target_status == "LOCKED":
+                    line_pen.setColor(QColor(PALETTE["muted"]))
+                    line_pen.setStyle(Qt.PenStyle.DotLine)
+                elif target_status in {"BORDER", "MARKET"}:
+                    line_pen.setStyle(Qt.PenStyle.DashLine)
+                painter.setPen(line_pen)
+                path = QPainterPath(start)
+                path.quadTo(control_point, end)
+                painter.drawPath(path)
+
+                arrow_base = sampled_points[-2] if len(sampled_points) >= 2 else start
+                arrow_tip = sampled_points[-1] if sampled_points else end
+                angle = math.atan2(arrow_tip.y() - arrow_base.y(), arrow_tip.x() - arrow_base.x())
+                arrow_len = 8
+                arrow_angle = math.pi / 7
+                draw_tip = QPoint(
+                    int(arrow_tip.x() - math.cos(angle) * 2),
+                    int(arrow_tip.y() - math.sin(angle) * 2),
+                )
+                left = QPoint(
+                    int(draw_tip.x() - math.cos(angle - arrow_angle) * arrow_len),
+                    int(draw_tip.y() - math.sin(angle - arrow_angle) * arrow_len),
+                )
+                right = QPoint(
+                    int(draw_tip.x() - math.cos(angle + arrow_angle) * arrow_len),
+                    int(draw_tip.y() - math.sin(angle + arrow_angle) * arrow_len),
+                )
+                painter.drawLine(draw_tip, left)
+                painter.drawLine(draw_tip, right)
+
+        font_metrics = painter.fontMetrics()
+        small_font = QFont(self.font())
+        small_font.setPointSize(max(7, self.font().pointSize() - 1))
+
+        for node_index, node in enumerate(self.world.nodes):
+            if node_index not in panned_positions:
+                continue
+            rect = node_rects[node_index]
+            border, fill, text_color, status = self._node_style(node_index, node)
+            painter.setPen(QPen(border, 2 if node_index == focus_index else 1.4))
+            painter.setBrush(fill)
+            painter.drawRoundedRect(rect, 9, 9)
+
+            label = self.label_provider(self.world, node_index, node)
+            label = font_metrics.elidedText(label, Qt.TextElideMode.ElideRight, rect.width() - 12)
+            painter.setPen(text_color)
+            painter.drawText(rect.adjusted(6, 5, -6, -20), Qt.AlignmentFlag.AlignCenter, label)
+
+            painter.setFont(small_font)
+            painter.setPen(QColor(PALETTE["muted"] if status == "LOCKED" else PALETTE["text"]))
+            depth_text = f"{status}  d{distances.get(node_index, self.world.node_depths.get(node_index, 1))}"
+            painter.drawText(rect.adjusted(6, 21, -6, -4), Qt.AlignmentFlag.AlignCenter, depth_text)
+            painter.setFont(self.font())
+
+            self.node_regions[node_index] = rect
+
+
+class RouteMapPane(QFrame):
+    def __init__(self, label_provider, status_provider, intel_provider):
+        super().__init__()
+        self.setObjectName("paneSurface")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.canvas = RouteMapCanvas(label_provider, status_provider, intel_provider)
+        layout.addWidget(self.canvas, 1)
+
+    def set_network_state(
+        self,
+        world,
+        cleared_nodes,
+        active_index,
+        status_text,
+        *,
+        staging: bool = False,
+        staging_text: str = "",
+    ):
+        self.canvas.set_network_state(
+            world,
+            cleared_nodes,
+            active_index,
+            status_text,
+            staging=staging,
+            staging_text=staging_text,
+        )
+
+
 class BootMenuOverlay(QFrame):
     new_tutorial = Signal()
     skip_tutorial = Signal()
@@ -479,6 +1384,8 @@ class SettingsPane(QFrame):
     theme_changed = Signal(str)
     font_bias_changed = Signal(int)
     reset_requested = Signal()
+    save_slots_requested = Signal()
+    exit_to_menu_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -488,7 +1395,7 @@ class SettingsPane(QFrame):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        self.title = QLabel("Display Settings")
+        self.title = QLabel("Display & Session")
         self.title.setObjectName("settingsTitle")
         layout.addWidget(self.title)
 
@@ -523,6 +1430,16 @@ class SettingsPane(QFrame):
         self.reset_button.clicked.connect(self.reset_requested.emit)
         layout.addWidget(self.reset_button, 0, Qt.AlignmentFlag.AlignLeft)
 
+        self.save_button = QPushButton("save slots")
+        self.save_button.setObjectName("settingsReset")
+        self.save_button.clicked.connect(self.save_slots_requested.emit)
+        layout.addWidget(self.save_button, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.exit_button = QPushButton("exit to main menu")
+        self.exit_button.setObjectName("settingsReset")
+        self.exit_button.clicked.connect(self.exit_to_menu_requested.emit)
+        layout.addWidget(self.exit_button, 0, Qt.AlignmentFlag.AlignLeft)
+
         layout.addStretch(1)
 
     def set_values(self, theme_name: str, font_bias: int):
@@ -533,6 +1450,124 @@ class SettingsPane(QFrame):
         blocked = self.font_bias_spin.blockSignals(True)
         self.font_bias_spin.setValue(font_bias)
         self.font_bias_spin.blockSignals(blocked)
+
+
+class SaveSlotsPane(QFrame):
+    slot_requested = Signal(str)
+    close_requested = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("saveSlotsPane")
+        self.mode = "load"
+        self.slot_entries: dict[str, dict] = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        self.title = QLabel("save slots")
+        self.title.setObjectName("saveSlotsTitle")
+        layout.addWidget(self.title)
+
+        self.note = QLabel("select a session archive")
+        self.note.setObjectName("saveSlotsNote")
+        self.note.setWordWrap(True)
+        layout.addWidget(self.note)
+
+        self.name_input = QLineEdit()
+        self.name_input.setObjectName("saveSlotsInput")
+        self.name_input.setPlaceholderText("session label")
+        layout.addWidget(self.name_input)
+
+        self.slot_buttons: dict[str, QPushButton] = {}
+        for slot_key in GameState.iter_save_slot_keys():
+            button = QPushButton()
+            button.setObjectName("saveSlotButton")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, key=slot_key: self.slot_requested.emit(key))
+            layout.addWidget(button)
+            self.slot_buttons[slot_key] = button
+
+        self.status = QLabel("")
+        self.status.setObjectName("saveSlotsStatus")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        self.close_button = QPushButton("close")
+        self.close_button.setObjectName("settingsReset")
+        self.close_button.clicked.connect(self.close_requested.emit)
+        layout.addWidget(self.close_button, 0, Qt.AlignmentFlag.AlignLeft)
+
+        layout.addStretch(1)
+
+    def set_mode(self, mode: str, entries: list[dict], *, default_name: str = "", status: str = ""):
+        self.mode = mode
+        self.slot_entries = {entry["slot_key"]: entry for entry in entries}
+        is_save_mode = mode == "save"
+
+        self.title.setText("save session" if is_save_mode else "load session")
+        self.note.setText(
+            "choose a manual slot and give this run a label."
+            if is_save_mode
+            else "choose an autosave or named slot to restore."
+        )
+        self.name_input.setVisible(is_save_mode)
+        if is_save_mode:
+            self.name_input.setText(default_name)
+            self.name_input.selectAll()
+            self.name_input.setFocus()
+        else:
+            self.name_input.clear()
+
+        for slot_key, button in self.slot_buttons.items():
+            entry = self.slot_entries.get(slot_key) or {
+                "slot_key": slot_key,
+                "exists": False,
+                "display_name": GameState.default_slot_label(slot_key),
+                "kind": "autosave" if slot_key == GameState.AUTOSAVE_SLOT_KEY else "manual",
+            }
+            if is_save_mode and slot_key == GameState.AUTOSAVE_SLOT_KEY:
+                button.hide()
+                continue
+            button.show()
+            if is_save_mode:
+                button.setEnabled(True)
+                button.setText(self._format_save_button(entry))
+            else:
+                button.setEnabled(bool(entry.get("exists")))
+                button.setText(self._format_load_button(entry))
+
+        self.status.setText(status)
+
+    def current_label(self) -> str:
+        return self.name_input.text().strip()
+
+    def _format_load_button(self, entry: dict) -> str:
+        label = entry.get("display_name") or GameState.default_slot_label(entry["slot_key"])
+        if not entry.get("exists"):
+            return f"{label}\nempty"
+        saved_at = entry.get("saved_at") or "unknown time"
+        day = entry.get("day")
+        handle = entry.get("handle") or "operator"
+        trace = entry.get("trace")
+        wallet = entry.get("wallet")
+        prefix = "autosave" if entry.get("slot_key") == GameState.AUTOSAVE_SLOT_KEY else label
+        return (
+            f"{prefix}\n"
+            f"{handle} // day {day if day is not None else '--'}  wallet {wallet if wallet is not None else '--'}c  "
+            f"trace {trace if trace is not None else '--'}\n"
+            f"{saved_at}"
+        )
+
+    def _format_save_button(self, entry: dict) -> str:
+        label = GameState.default_slot_label(entry["slot_key"])
+        if not entry.get("exists"):
+            return f"{label}\nwrite new save here"
+        saved_at = entry.get("saved_at") or "unknown time"
+        current_name = entry.get("display_name") or label
+        day = entry.get("day")
+        return f"{label}\noverwrite {current_name} // day {day if day is not None else '--'}\n{saved_at}"
 
 
 class TerminalConsole(QPlainTextEdit):
@@ -556,6 +1591,113 @@ class TerminalConsole(QPlainTextEdit):
         self.prompt_active = False
         self.input_locked = False
         self._render_cache = ""
+        self.completion_provider = None
+        self._completion_cycle_seed = ""
+        self._completion_cycle_values: list[str] = []
+        self._completion_matches: list[str] = []
+
+    def set_completion_provider(self, provider):
+        self.completion_provider = provider
+        self.reset_completion_cycle()
+
+    def reset_completion_cycle(self):
+        self._completion_cycle_seed = ""
+        self._completion_cycle_values = []
+        self._completion_matches = []
+
+    def _show_completion_hint(self, matches: list[str]):
+        if len(matches) <= 1:
+            QToolTip.hideText()
+            return
+        preview = matches[:12]
+        hint = "\n".join(preview)
+        if len(matches) > len(preview):
+            hint += f"\n... +{len(matches) - len(preview)} more"
+        QToolTip.showText(self.mapToGlobal(self.cursorRect().bottomRight()), hint, self)
+
+    def _current_token_bounds(self):
+        text = self.current_input
+        if not text or text.endswith(" "):
+            return len(text), len(text)
+        match = re.search(r"\S+$", text)
+        if not match:
+            return len(text), len(text)
+        return match.start(), match.end()
+
+    @staticmethod
+    def _common_completion_prefix(matches: list[str]) -> str:
+        if not matches:
+            return ""
+        prefix = matches[0]
+        for candidate in matches[1:]:
+            limit = min(len(prefix), len(candidate))
+            index = 0
+            while index < limit and prefix[index] == candidate[index]:
+                index += 1
+            prefix = prefix[:index]
+            if not prefix:
+                break
+        return prefix
+
+    def apply_tab_completion(self):
+        if not callable(self.completion_provider):
+            return False
+
+        if self._completion_cycle_values and self.current_input in [self._completion_cycle_seed, *self._completion_cycle_values]:
+            if self.current_input == self._completion_cycle_seed:
+                next_index = 0
+            else:
+                current_index = self._completion_cycle_values.index(self.current_input)
+                next_index = (current_index + 1) % len(self._completion_cycle_values)
+            self.current_input = self._completion_cycle_values[next_index]
+            self._sync_view()
+            self._show_completion_hint(self._completion_matches)
+            return True
+
+        start, end = self._current_token_bounds()
+        prefix_text = self.current_input[:start]
+        current_token = self.current_input[start:end]
+        matches = list(self.completion_provider(self.current_input) or [])
+        if not matches:
+            self.reset_completion_cycle()
+            return False
+
+        common_prefix = self._common_completion_prefix(matches)
+        if len(matches) == 1:
+            completed = prefix_text + matches[0]
+            if not completed.endswith(" "):
+                completed += " "
+            self.current_input = completed
+            self.reset_completion_cycle()
+            self._sync_view()
+            self._show_completion_hint(matches)
+            return True
+
+        if not prefix_text and not current_token:
+            self._completion_cycle_seed = self.current_input
+            self._completion_cycle_values = [match for match in matches]
+            self._completion_matches = matches
+            self._show_completion_hint(matches)
+            return True
+
+        cycle_values = [prefix_text + match for match in matches]
+        if common_prefix and len(common_prefix) > len(current_token):
+            self.current_input = prefix_text + common_prefix
+            self._completion_cycle_seed = self.current_input
+            self._completion_cycle_values = cycle_values
+            self._completion_matches = matches
+            self._sync_view()
+            self._show_completion_hint(matches)
+            return True
+
+        cycle_seed = self.current_input
+        self.current_input = cycle_values[0]
+        self._completion_cycle_seed = cycle_seed
+        self._completion_cycle_values = cycle_values
+        self._completion_matches = matches
+        self._sync_view()
+        self._show_completion_hint(matches)
+        return True
 
     def set_history(self, snapshot: list[tuple[str, str]]) -> bool:
         lines = [line for line, _tone in snapshot]
@@ -574,6 +1716,7 @@ class TerminalConsole(QPlainTextEdit):
         self.prompt_active = active
         if not active:
             self.current_input = ""
+            self.reset_completion_cycle()
         self._sync_view()
 
     def move_cursor_to_end(self):
@@ -631,13 +1774,21 @@ class TerminalConsole(QPlainTextEdit):
 
         if modifiers & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_L:
             self.current_input = ""
+            self.reset_completion_cycle()
             self._sync_view()
             self.command_submitted.emit("cls")
+            return
+
+        if key == Qt.Key.Key_Tab:
+            if self.apply_tab_completion():
+                return
+            event.ignore()
             return
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             command = self.current_input
             self.current_input = ""
+            self.reset_completion_cycle()
             self._sync_view()
             self.command_submitted.emit(command)
             return
@@ -645,11 +1796,13 @@ class TerminalConsole(QPlainTextEdit):
         if key == Qt.Key.Key_Backspace:
             if self.current_input:
                 self.current_input = self.current_input[:-1]
+                self.reset_completion_cycle()
                 self._sync_view()
             return
 
         if key == Qt.Key.Key_Escape:
             self.current_input = ""
+            self.reset_completion_cycle()
             self._sync_view()
             return
 
@@ -662,6 +1815,7 @@ class TerminalConsole(QPlainTextEdit):
                 pasted = QApplication.clipboard().text().replace("\r", "").replace("\n", " ")
                 if pasted:
                     self.current_input += pasted
+                    self.reset_completion_cycle()
                     self._sync_view()
             elif copy_match:
                 super().keyPressEvent(event)
@@ -669,6 +1823,7 @@ class TerminalConsole(QPlainTextEdit):
 
         if text and text >= " ":
             self.current_input += text
+            self.reset_completion_cycle()
             self._sync_view()
             return
 
@@ -762,17 +1917,20 @@ class PanelHighlighter(QSyntaxHighlighter):
             (re.compile(r"^(WHY:.*)$"), build_char_format(PALETTE["cyan"])),
             (re.compile(r"^(LOOK:.*|CLICK:.*)$"), build_char_format(PALETTE["green"], bold=True)),
             (re.compile(r"^(\[layer \d+\])$"), build_char_format(PALETTE["yellow"], bold=True)),
+            (re.compile(r"^(RAM .*)$"), build_char_format(PALETTE["yellow"], bold=True)),
+            (re.compile(r"^(STACK DELTA.*|STACK OUTCOME.*)$"), build_char_format(PALETTE["magenta"], bold=True)),
             (re.compile(r"^[A-Z0-9 /:_-]{6,}$"), build_char_format(PALETTE["cyan"], bold=True)),
             (
                 re.compile(
-                    r"^(HOST|WEAPON|COUNTER|ENTRY|EXPOSURE|INTENT|WEAK POINT|VULN|ADAPT|DEFENSE|HANDLE|TITLE|DAY|WALLET|TRACE|RAM|SIGNATURE|ITEMS|LOCAL IP|BOT BAY|CLASS GUIDE|OWNER|ROLE|NETRANGE|OPERATING|INTEL|SUBSYSTEMS|LINK|PORTS)\b"
+                    r"^(HOST|WEAPON|COUNTER|ENTRY|EXPOSURE|INTENT|WEAK POINT|VULN|ADAPT|DEFENSE|CACHE|HANDLE|TITLE|DAY|WALLET|TRACE|RAM|SIGNATURE|ITEMS|LOCAL IP|BOT BAY|CLASS GUIDE|OWNER|ROLE|NETRANGE|OPERATING|INTEL|SUBSYSTEMS|LINK|PORTS|STACK)\b"
                 ),
                 build_char_format(PALETTE["cyan"], bold=True),
             ),
             (re.compile(r"\b(OS|SEC|NET|MEM|STO)\b"), build_char_format(PALETTE["accent"], bold=True)),
-            (re.compile(r"\b(CLEARED|MARKET|LIVE|SCANNED|AVAILABLE|DONE|TRACKING)\b"), build_char_format(PALETTE["green"], bold=True)),
-            (re.compile(r"\b(WARM|TRACE|WARNING|ALERT)\b"), build_char_format(PALETTE["yellow"], bold=True)),
-            (re.compile(r"\b(HOT|LOCKED|FINAL|FAILED|BURNED|TERMINATED)\b"), build_char_format(PALETTE["red"], bold=True)),
+            (re.compile(r"\b(CLEARED|ROOTED|MARKET|LIVE|SCANNED|AVAILABLE|DONE|TRACKING)\b"), build_char_format(PALETTE["green"], bold=True)),
+            (re.compile(r"\b(WARM|TRACE|WARNING|ALERT|CONTESTED|BORDER|LOCKDOWN)\b"), build_char_format(PALETTE["yellow"], bold=True)),
+            (re.compile(r"\b(HOT|LOCKED|FAILED|BURNED|TERMINATED|BRICKED|INFECTED)\b"), build_char_format(PALETTE["red"], bold=True)),
+            (re.compile(r"\b(FORENSIC)\b"), build_char_format(PALETTE["magenta"], bold=True)),
             (re.compile(r"^(mail =.*|bot =.*)$"), build_char_format(PALETTE["cyan"])),
             (re.compile(r"^(recon ladder:|host architecture)$"), build_char_format(PALETTE["cyan"], bold=True)),
         ]
@@ -809,6 +1967,15 @@ class ArchiveHighlighter(QSyntaxHighlighter):
         self.setFormat(0, len(text), self.default_format)
         stripped = text.strip()
         if not stripped:
+            return
+        if stripped.startswith("ALERT"):
+            self.setFormat(0, len(text), build_char_format(PALETTE["red"], bold=True))
+            return
+        if stripped.startswith("WARNING"):
+            self.setFormat(0, len(text), build_char_format(PALETTE["yellow"], bold=True))
+            return
+        if stripped.startswith("NOTICE") or stripped.startswith("HOSTILE"):
+            self.setFormat(0, len(text), build_char_format(PALETTE["magenta"], bold=True))
             return
         if stripped.startswith("SESSION LOG //") or stripped.startswith("entries:") or stripped.startswith("format:"):
             self.setFormat(0, len(text), self.header_format)
@@ -1053,6 +2220,7 @@ class FloatingWindow(QFrame):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setProperty("active", False)
         self.setProperty("guided", False)
+        self.setProperty("disturbed", False)
         self.setProperty("accent", key)
         self.setMinimumSize(280, 180)
 
@@ -1120,6 +2288,13 @@ class FloatingWindow(QFrame):
     def set_guided(self, guided: bool):
         if self.property("guided") != guided:
             self.setProperty("guided", guided)
+            repolish(self)
+            repolish(self.header)
+            repolish(self.content_shell)
+
+    def set_disturbed(self, disturbed: bool):
+        if self.property("disturbed") != disturbed:
+            self.setProperty("disturbed", disturbed)
             repolish(self)
             repolish(self.header)
             repolish(self.content_shell)
@@ -1212,9 +2387,14 @@ class FloatingWindow(QFrame):
 
 
 class TerminalRoguePySideWindow(QMainWindow):
+    BOOT_STEP_SECONDS = 0.58
+    BOOT_STAGGER_SECONDS = 0.18
+    BOOT_HOLD_SECONDS = 0.65
+
     def __init__(self):
         super().__init__()
         self.backend = PySideGameBackend()
+        self.backend.boot_menu = True
         self._prompt_was_active = False
         self._last_log_snapshot: list[tuple[str, str]] = []
         self._initial_layout_done = False
@@ -1227,14 +2407,20 @@ class TerminalRoguePySideWindow(QMainWindow):
         self.window_buttons: dict[str, QPushButton] = {}
         self.taskbar_seen_keys: set[str] = set()
         self.primary_window_keys = ("terminal", "log", "player", "target", "objective", "route", "databank")
+        self.session_boot_profile: str | None = None
+        self.session_boot_started_at: float | None = None
+        self.window_boot_started_at: dict[str, float] = {}
         self.tutorial_boot_started = False
         self.tutorial_boot_complete = False
         self.tutorial_boot_step = 0
         self.tutorial_boot_revealed: set[str] = set()
         self.tutorial_warmup_requested = False
         self.tutorial_warmup_gate_pending = False
+        self.tutorial_warmup_release_sent = False
+        self.tutorial_live_boot_started_at: dict[str, float] = {}
         self.main_menu_active = True
         self.main_menu_pending_choice: str | None = None
+        self.save_manager_mode: str | None = None
         self.dev_log_lines: list[tuple[str, str]] = []
         self.dev_command_history: list[str] = []
         self._dev_last_snapshot: list[tuple[str, str]] = []
@@ -1306,7 +2492,7 @@ class TerminalRoguePySideWindow(QMainWindow):
         self.boot_menu.setParent(self.desktop)
         self.boot_menu.new_tutorial.connect(lambda: self.submit_main_menu_choice("1"))
         self.boot_menu.skip_tutorial.connect(lambda: self.submit_main_menu_choice("2"))
-        self.boot_menu.continue_requested.connect(lambda: self.submit_main_menu_choice("3"))
+        self.boot_menu.continue_requested.connect(self.open_load_save_manager)
         self.boot_menu.quit_requested.connect(self.close)
         self.boot_menu.show()
 
@@ -1314,20 +2500,23 @@ class TerminalRoguePySideWindow(QMainWindow):
         self.feed = self.shell.feed
         self.input = self.feed
         self.feed.command_submitted.connect(self.submit_command)
+        self.feed.set_completion_provider(self.get_live_terminal_completions)
         self.feed_highlighter = FeedHighlighter(self.feed.document())
         self.log_archive = LiveLogPane()
 
         self.player = TerminalPane()
         self.target = TerminalPane()
         self.objective = ObjectivePane(self.open_tutorial_window)
-        self.route = TerminalPane()
+        self.route = RouteMapPane(self.route_node_label, self.backend.get_node_status_text, self.backend.build_node_intel_summary)
         self.databank = DatabankPane(self.lookup_databank_entry, self.open_databank_entry)
         self.dev_shell = TerminalShell()
         self.dev_feed = self.dev_shell.feed
         self.dev_input = self.dev_feed
         self.dev_feed.command_submitted.connect(self.submit_dev_command)
+        self.dev_feed.set_completion_provider(self.get_dev_terminal_completions)
         self.dev_feed_highlighter = FeedHighlighter(self.dev_feed.document())
         self.settings = SettingsPane()
+        self.save_slots = SaveSlotsPane()
         self.payload_detail = TerminalPane()
         self.tutorial_detail = TutorialPane()
         self.tutorial_detail.clicked.connect(self.handle_tutorial_click)
@@ -1335,7 +2524,6 @@ class TerminalRoguePySideWindow(QMainWindow):
             PanelHighlighter(self.player.body.document()),
             PanelHighlighter(self.target.body.document()),
             PanelHighlighter(self.objective.body.document()),
-            PanelHighlighter(self.route.body.document()),
             PanelHighlighter(self.databank.body.document()),
             PanelHighlighter(self.payload_detail.body.document()),
             PanelHighlighter(self.tutorial_detail.body.document()),
@@ -1351,15 +2539,20 @@ class TerminalRoguePySideWindow(QMainWindow):
         self.create_window("databank", self.databank, "databank")
         self.create_window("dev", self.dev_shell, "developer console", show=False)
         self.create_window("settings", self.settings, "settings", show=False)
+        self.create_window("saves", self.save_slots, "save slots", show=False)
         self.create_window("payload", self.payload_detail, "payload", show=False)
         self.create_window("tutorial", self.tutorial_detail, "tutorial coach", show=False)
 
         self.settings.theme_changed.connect(self.change_color_scheme)
         self.settings.font_bias_changed.connect(self.change_font_bias)
         self.settings.reset_requested.connect(self.reset_display_settings)
+        self.settings.save_slots_requested.connect(self.open_save_save_manager)
+        self.settings.exit_to_menu_requested.connect(self.return_to_main_menu)
         self.settings.set_values(self.color_scheme_name, self.font_size_bias)
+        self.save_slots.slot_requested.connect(self.handle_save_slot_requested)
+        self.save_slots.close_requested.connect(self.close_save_manager)
 
-        for key in ["terminal", "log", "player", "target", "objective", "route", "databank", "dev", "settings", "payload", "tutorial"]:
+        for key in ["terminal", "log", "player", "target", "objective", "route", "databank", "dev", "settings", "saves", "payload", "tutorial"]:
             button = QPushButton(TASKBAR_LABELS.get(key, key))
             button.setObjectName("dockButton")
             button.setCheckable(True)
@@ -1390,7 +2583,7 @@ class TerminalRoguePySideWindow(QMainWindow):
         accent = self.get_window_accent(key)
         window.header.accent_dot.setStyleSheet(f"background: {accent}; border-radius: 5px;")
         window.activated.connect(self.activate_window)
-        window.hidden_from_ui.connect(lambda _key: self.refresh_taskbar())
+        window.hidden_from_ui.connect(lambda _key, name=key: self.on_window_hidden(name))
         window.shown_from_ui.connect(lambda _key: self.refresh_taskbar())
         self.floating_windows[key] = window
         if show:
@@ -1398,6 +2591,11 @@ class TerminalRoguePySideWindow(QMainWindow):
             self.taskbar_seen_keys.add(key)
         else:
             window.hide()
+
+    def on_window_hidden(self, key: str):
+        if key == "saves":
+            self.save_manager_mode = None
+        self.refresh_taskbar()
 
     def get_window_accent(self, key: str) -> str:
         accent_map = {
@@ -1410,6 +2608,7 @@ class TerminalRoguePySideWindow(QMainWindow):
             "databank": PALETTE["white"],
             "dev": PALETTE["red"],
             "settings": PALETTE["accent"],
+            "saves": PALETTE["cyan"],
             "payload": PALETTE["yellow"],
             "tutorial": PALETTE["magenta"],
         }
@@ -1429,6 +2628,7 @@ class TerminalRoguePySideWindow(QMainWindow):
     def reflow_desktop(self):
         self.update_responsive_scale()
         self.layout_boot_menu()
+        self.layout_save_manager()
         if self.main_menu_active:
             self.apply_main_menu_visibility()
             self.refresh_taskbar()
@@ -1445,22 +2645,45 @@ class TerminalRoguePySideWindow(QMainWindow):
         y = rect.top() + max(18, (rect.height() - height) // 3)
         self.boot_menu.setGeometry(x, y, width, height)
 
+    def layout_save_manager(self):
+        window = self.floating_windows.get("saves")
+        if not window:
+            return
+        rect = self.desktop.rect().adjusted(28, 28, -28, -28)
+        width = max(430, min(620, rect.width() // 2))
+        height = max(340, min(500, rect.height() // 2))
+        x = rect.left() + max(18, (rect.width() - width) // 2)
+        y = rect.top() + max(18, (rect.height() - height) // 3)
+        window.is_maximized_window = False
+        window.header.max_button.setText("[]")
+        window.setGeometry(x, y, width, height)
+        window._normal_geometry = window.geometry()
+        window.clamp_to_desktop()
+
     def update_main_menu_state(self):
-        save_available = os.path.exists(GameState.resolve_save_path())
+        save_available = any(entry.get("exists") for entry in GameState.list_save_slots())
         self.boot_menu.set_continue_available(save_available)
         if not self.main_menu_pending_choice:
             self.boot_menu.set_busy(False, status=self.boot_menu.status.text())
 
     def apply_main_menu_visibility(self):
-        for window in self.floating_windows.values():
+        for key, window in self.floating_windows.items():
+            if key == "saves" and self.save_manager_mode == "load":
+                continue
             window.hide()
         self.boot_menu.show()
         self.boot_menu.raise_()
+        if self.save_manager_mode == "load":
+            window = self.floating_windows.get("saves")
+            if window:
+                window.show()
+                window.raise_()
         self.dock.hide()
 
     def show_main_menu(self):
         self.main_menu_active = True
         self.main_menu_pending_choice = None
+        self.close_save_manager()
         self.update_main_menu_state()
         self.layout_boot_menu()
         self.apply_main_menu_visibility()
@@ -1470,8 +2693,39 @@ class TerminalRoguePySideWindow(QMainWindow):
         self.main_menu_pending_choice = None
         self.boot_menu.set_busy(False)
         self.boot_menu.hide()
+        self.close_save_manager()
         self.dock.show()
         self.reset_window_layout()
+
+    def dismiss_main_menu_for_tutorial_loading(self):
+        self.main_menu_active = False
+        self.main_menu_pending_choice = None
+        self.boot_menu.set_busy(False)
+        self.boot_menu.hide()
+        self.dock.hide()
+        for key in self.primary_window_keys:
+            window = self.floating_windows.get(key)
+            if window:
+                window.hide()
+        tutorial_window = self.floating_windows.get("tutorial")
+        if tutorial_window:
+            tutorial_window.hide()
+        if self.backend.objective_is_tutorial:
+            self.sync_tutorial_overlay(force_show=True)
+        self.refresh_taskbar()
+
+    def dismiss_main_menu_for_standard_loading(self):
+        self.main_menu_active = False
+        pending_choice = self.main_menu_pending_choice
+        self.boot_menu.set_busy(False)
+        self.boot_menu.hide()
+        self.dock.hide()
+        for key in self.primary_window_keys:
+            window = self.floating_windows.get(key)
+            if window:
+                window.hide()
+        self.main_menu_pending_choice = pending_choice
+        self.refresh_taskbar()
 
     def submit_main_menu_choice(self, choice: str):
         self.main_menu_pending_choice = choice
@@ -1480,6 +2734,207 @@ class TerminalRoguePySideWindow(QMainWindow):
         self.layout_boot_menu()
         self.apply_main_menu_visibility()
         self.backend.input_queue.put(choice)
+
+    def open_load_save_manager(self):
+        entries = GameState.list_save_slots()
+        self.save_manager_mode = "load"
+        self.save_slots.set_mode("load", entries, status="choose an autosave or named slot to continue.")
+        self.layout_save_manager()
+        window = self.floating_windows["saves"]
+        window.show()
+        window.raise_()
+        self.apply_main_menu_visibility()
+        self.refresh_taskbar()
+
+    def open_save_save_manager(self):
+        if not self.backend.state or not self.backend.player:
+            return
+        settings_window = self.floating_windows.get("settings")
+        if settings_window and settings_window.isVisible():
+            settings_window.hide_window()
+        default_name = ""
+        state = self.backend.state
+        player = self.backend.player
+        if state and player:
+            default_name = f"{player.handle} // day {state.day}"
+        entries = GameState.list_save_slots()
+        self.save_manager_mode = "save"
+        self.save_slots.set_mode("save", entries, default_name=default_name, status="pick a slot to write this run.")
+        self.layout_save_manager()
+        window = self.floating_windows["saves"]
+        window.show()
+        window.raise_()
+        self.activate_window("saves")
+        self.refresh_taskbar()
+
+    def close_save_manager(self):
+        self.save_manager_mode = None
+        window = self.floating_windows.get("saves")
+        if window:
+            window.hide()
+        self.refresh_taskbar()
+
+    def handle_save_slot_requested(self, slot_key: str):
+        if self.save_manager_mode == "load":
+            self.backend.selected_save_reference = slot_key
+            self.close_save_manager()
+            self.submit_main_menu_choice("3")
+            return
+
+        if self.save_manager_mode == "save":
+            label = self.save_slots.current_label()
+            try:
+                self.backend.write_named_save(slot_key, label)
+            except Exception as exc:
+                self.save_slots.status.setText(f"save failed: {exc}")
+                return
+            saved_name = (label or GameState.default_slot_label(slot_key)).strip()
+            self.save_slots.status.setText(f"{saved_name} written successfully.")
+            self.update_main_menu_state()
+            self.close_save_manager()
+
+    def return_to_main_menu(self):
+        if self.main_menu_active:
+            return
+        settings_window = self.floating_windows.get("settings")
+        if settings_window and settings_window.isVisible():
+            settings_window.hide_window()
+        self.close_save_manager()
+        self.clear_boot_sequence()
+        self.main_menu_active = True
+        self.main_menu_pending_choice = None
+        self.boot_menu.set_busy(
+            True,
+            subtitle="closing live session",
+            status="writing checkpoint and returning to the boot menu...",
+        )
+        self.layout_boot_menu()
+        self.apply_main_menu_visibility()
+        self.backend.request_return_to_main_menu()
+
+    def clear_boot_sequence(self):
+        self.session_boot_profile = None
+        self.session_boot_started_at = None
+        self.window_boot_started_at = {}
+
+    def clear_tutorial_live_boot_sequence(self):
+        self.tutorial_live_boot_started_at = {}
+
+    def start_standard_boot_sequence(self):
+        self.session_boot_profile = "standard"
+        self.session_boot_started_at = monotonic()
+        self.window_boot_started_at = {}
+        self.clear_tutorial_live_boot_sequence()
+        self.dock.hide()
+        for key in self.primary_window_keys:
+            window = self.floating_windows.get(key)
+            if window:
+                window.hide()
+
+    def is_standard_boot_active(self) -> bool:
+        return self.session_boot_profile == "standard" and self.session_boot_started_at is not None
+
+    def mark_window_boot_started(self, key: str):
+        if key not in self.primary_window_keys:
+            return
+        self.window_boot_started_at.setdefault(key, monotonic())
+
+    def standard_boot_has_window_started(self, key: str) -> bool:
+        if not self.is_standard_boot_active():
+            return False
+        if key not in self.primary_window_keys or self.session_boot_started_at is None:
+            return False
+        start_time = self.session_boot_started_at + (self.primary_window_keys.index(key) * self.BOOT_STAGGER_SECONDS)
+        return monotonic() >= start_time
+
+    def start_tutorial_live_boot_sequence(self):
+        started = monotonic()
+        self.tutorial_live_boot_started_at = {
+            "objective": started,
+            "player": started + 0.18,
+            "target": started + 0.36,
+            "route": started + 0.54,
+            "databank": started + 0.72,
+            "log": started + 0.90,
+        }
+
+    def get_tutorial_live_boot_stage(self, key: str) -> int | None:
+        if not self.backend.objective_is_tutorial:
+            return None
+        start_time = self.tutorial_live_boot_started_at.get(key)
+        if start_time is None:
+            return None
+        _label, commands = get_window_boot_sequence(key)
+        total_stages = len(commands) + 2
+        elapsed = monotonic() - start_time
+        if elapsed < 0:
+            return None
+        max_duration = total_stages * self.BOOT_STEP_SECONDS + self.BOOT_HOLD_SECONDS
+        if elapsed > max_duration:
+            return None
+        return min(total_stages - 1, int(elapsed / self.BOOT_STEP_SECONDS))
+
+    def get_window_boot_stage(self, key: str) -> int | None:
+        if key not in self.primary_window_keys:
+            return None
+        if self.session_boot_profile not in {"standard", "tutorial"}:
+            return None
+        _label, commands = get_window_boot_sequence(key)
+        total_stages = len(commands) + 2
+        if self.session_boot_profile == "standard":
+            if self.session_boot_started_at is None:
+                return None
+            start_time = self.session_boot_started_at + (self.primary_window_keys.index(key) * self.BOOT_STAGGER_SECONDS)
+        else:
+            start_time = self.window_boot_started_at.get(key)
+            if start_time is None:
+                return None
+        elapsed = monotonic() - start_time
+        if elapsed < 0:
+            return None
+        max_duration = total_stages * self.BOOT_STEP_SECONDS + self.BOOT_HOLD_SECONDS
+        if elapsed > max_duration:
+            return None
+        return min(total_stages - 1, int(elapsed / self.BOOT_STEP_SECONDS))
+
+    def get_window_boot_text(self, key: str) -> str | None:
+        stage = self.get_window_boot_stage(key)
+        if stage is None:
+            stage = self.get_tutorial_live_boot_stage(key)
+        if stage is None:
+            return None
+        return build_window_boot_text(key, stage)
+
+    def get_window_boot_snapshot(self, key: str) -> list[tuple[str, str]] | None:
+        stage = self.get_window_boot_stage(key)
+        if stage is None:
+            stage = self.get_tutorial_live_boot_stage(key)
+        if stage is None:
+            return None
+        return build_window_boot_snapshot(key, stage)
+
+    def is_any_window_booting(self) -> bool:
+        return any(self.get_window_boot_stage(key) is not None for key in self.primary_window_keys)
+
+    def settle_boot_sequence(self):
+        was_standard = self.session_boot_profile == "standard"
+        if self.session_boot_profile and not self.is_any_window_booting():
+            self.clear_boot_sequence()
+            if was_standard and not self.main_menu_active:
+                self.dock.show()
+                for key in self.primary_window_keys:
+                    window = self.floating_windows.get(key)
+                    if window:
+                        window.show()
+                self.activate_window("terminal")
+                self.refresh_taskbar()
+        if self.tutorial_live_boot_started_at:
+            active = False
+            for key in tuple(self.tutorial_live_boot_started_at):
+                if self.get_tutorial_live_boot_stage(key) is not None:
+                    active = True
+            if not active:
+                self.clear_tutorial_live_boot_sequence()
 
     def reset_window_layout(self):
         if self.main_menu_active:
@@ -1490,29 +2945,30 @@ class TerminalRoguePySideWindow(QMainWindow):
             return
 
         gap = 14
-        top_h = max(150, int(rect.height() * 0.19))
+        top_h = max(148, int(rect.height() * 0.18))
         bottom_h = rect.height() - top_h - gap
 
-        side_w = max(390, int(rect.width() * 0.35))
+        side_w = max(440, int(rect.width() * 0.39))
         if rect.width() - side_w - gap < 560:
-            side_w = max(340, int(rect.width() * 0.31))
+            side_w = max(380, int(rect.width() * 0.35))
         terminal_w = rect.width() - side_w - gap
         left_top_w = terminal_w
         objective_w = max(250, int(left_top_w * 0.34))
         databank_w = left_top_w - objective_w - gap
         log_h = max(170, int(bottom_h * 0.26))
         terminal_h = max(260, bottom_h - log_h - gap)
-        route_h = max(180, int(bottom_h * 0.23))
-        target_h = max(250, bottom_h - route_h - gap)
+        route_h = max(230, int(bottom_h * 0.31))
+        target_h = max(220, bottom_h - route_h - gap)
         tutorial_boot_active = self.is_tutorial_boot_active()
+        standard_boot_active = self.is_standard_boot_active()
 
-        self._place_window("objective", rect.left(), rect.top(), objective_w, top_h, tutorial_boot=tutorial_boot_active)
-        self._place_window("databank", rect.left() + objective_w + gap, rect.top(), databank_w, top_h, tutorial_boot=tutorial_boot_active)
-        self._place_window("player", rect.left() + terminal_w + gap, rect.top(), side_w, top_h, tutorial_boot=tutorial_boot_active)
-        self._place_window("terminal", rect.left(), rect.top() + top_h + gap, terminal_w, terminal_h, tutorial_boot=tutorial_boot_active)
-        self._place_window("log", rect.left(), rect.top() + top_h + gap + terminal_h + gap, terminal_w, log_h, tutorial_boot=tutorial_boot_active)
-        self._place_window("target", rect.left() + terminal_w + gap, rect.top() + top_h + gap, side_w, target_h, tutorial_boot=tutorial_boot_active)
-        self._place_window("route", rect.left() + terminal_w + gap, rect.top() + top_h + gap + target_h + gap, side_w, route_h, tutorial_boot=tutorial_boot_active)
+        self._place_window("objective", rect.left(), rect.top(), objective_w, top_h, tutorial_boot=tutorial_boot_active, standard_boot=standard_boot_active)
+        self._place_window("databank", rect.left() + objective_w + gap, rect.top(), databank_w, top_h, tutorial_boot=tutorial_boot_active, standard_boot=standard_boot_active)
+        self._place_window("player", rect.left() + terminal_w + gap, rect.top(), side_w, top_h, tutorial_boot=tutorial_boot_active, standard_boot=standard_boot_active)
+        self._place_window("terminal", rect.left(), rect.top() + top_h + gap, terminal_w, terminal_h, tutorial_boot=tutorial_boot_active, standard_boot=standard_boot_active)
+        self._place_window("log", rect.left(), rect.top() + top_h + gap + terminal_h + gap, terminal_w, log_h, tutorial_boot=tutorial_boot_active, standard_boot=standard_boot_active)
+        self._place_window("target", rect.left() + terminal_w + gap, rect.top() + top_h + gap, side_w, target_h, tutorial_boot=tutorial_boot_active, standard_boot=standard_boot_active)
+        self._place_window("route", rect.left() + terminal_w + gap, rect.top() + top_h + gap + target_h + gap, side_w, route_h, tutorial_boot=tutorial_boot_active, standard_boot=standard_boot_active)
 
         settings_window = self.floating_windows.get("settings")
         if settings_window:
@@ -1528,17 +2984,24 @@ class TerminalRoguePySideWindow(QMainWindow):
         if tutorial_boot_active:
             self.apply_tutorial_boot_visibility()
             self.activate_window("tutorial")
+        elif standard_boot_active:
+            self.apply_standard_boot_visibility()
         else:
             self.activate_window("terminal")
         self.refresh_taskbar()
 
-    def _place_window(self, key: str, x: int, y: int, width: int, height: int, *, tutorial_boot: bool = False):
+    def _place_window(self, key: str, x: int, y: int, width: int, height: int, *, tutorial_boot: bool = False, standard_boot: bool = False):
         window = self.floating_windows[key]
         window.is_maximized_window = False
         window._normal_geometry = QRect(x, y, width, height)
         window.setGeometry(x, y, width, height)
         window.header.max_button.setText("[]")
-        should_show = not tutorial_boot or key in self.tutorial_boot_revealed
+        if tutorial_boot:
+            should_show = key in self.tutorial_boot_revealed
+        elif standard_boot:
+            should_show = self.standard_boot_has_window_started(key)
+        else:
+            should_show = True
         if should_show:
             window.show()
             window.raise_()
@@ -1592,12 +3055,16 @@ class TerminalRoguePySideWindow(QMainWindow):
         ]
 
     def start_tutorial_boot_sequence(self):
+        self.clear_boot_sequence()
+        self.clear_tutorial_live_boot_sequence()
+        self.session_boot_profile = "tutorial"
         self.tutorial_boot_started = True
         self.tutorial_boot_complete = False
         self.tutorial_boot_step = 0
         self.tutorial_boot_revealed = set()
         self.tutorial_warmup_requested = False
         self.tutorial_warmup_gate_pending = False
+        self.tutorial_warmup_release_sent = False
         for key in self.primary_window_keys:
             window = self.floating_windows.get(key)
             if window:
@@ -1608,7 +3075,10 @@ class TerminalRoguePySideWindow(QMainWindow):
         self.tutorial_boot_complete = True
         self.tutorial_boot_revealed = set(self.primary_window_keys)
         self.tutorial_warmup_gate_pending = True
+        self.tutorial_warmup_requested = False
+        self.tutorial_warmup_release_sent = False
         for key in self.primary_window_keys:
+            self.mark_window_boot_started(key)
             window = self.floating_windows.get(key)
             if window:
                 window.show()
@@ -1627,6 +3097,7 @@ class TerminalRoguePySideWindow(QMainWindow):
             if not window:
                 continue
             if key in self.tutorial_boot_revealed:
+                self.mark_window_boot_started(key)
                 window.show()
             else:
                 window.hide()
@@ -1635,13 +3106,27 @@ class TerminalRoguePySideWindow(QMainWindow):
             tutorial_window.show()
             tutorial_window.raise_()
 
+    def apply_standard_boot_visibility(self):
+        if not self.is_standard_boot_active():
+            return
+        for key in self.primary_window_keys:
+            window = self.floating_windows.get(key)
+            if not window:
+                continue
+            if self.standard_boot_has_window_started(key):
+                window.show()
+                window.raise_()
+            else:
+                window.hide()
+
     def handle_tutorial_click(self):
         if not self.is_tutorial_boot_active():
             if self.is_tutorial_warmup_gate_active():
                 if not self.tutorial_warmup_requested:
                     self.tutorial_warmup_requested = True
                     self.sync_tutorial_overlay(force_show=True)
-                    if self.backend.active_prompt:
+                    if self.backend.active_prompt and not self.tutorial_warmup_release_sent:
+                        self.tutorial_warmup_release_sent = True
                         self.backend.input_queue.put("")
                 return
             self.open_tutorial_window()
@@ -1731,12 +3216,13 @@ class TerminalRoguePySideWindow(QMainWindow):
             self.player.body,
             self.target.body,
             self.objective.body,
-            self.route.body,
             self.databank.body,
             self.payload_detail.body,
             self.tutorial_detail.body,
         ]:
             widget.setFont(mono_font)
+
+        self.route.canvas.setFont(mono_font)
 
         for widget in [
             self.settings,
@@ -1745,8 +3231,19 @@ class TerminalRoguePySideWindow(QMainWindow):
             self.settings.theme_combo,
             self.settings.font_bias_spin,
             self.settings.reset_button,
+            self.settings.save_button,
+            self.settings.exit_button,
+            self.save_slots,
+            self.save_slots.title,
+            self.save_slots.note,
+            self.save_slots.name_input,
+            self.save_slots.status,
+            self.save_slots.close_button,
         ]:
             widget.setFont(ui_font)
+
+        for button in self.save_slots.slot_buttons.values():
+            button.setFont(ui_font)
 
         for chip in [self.day_chip, self.wallet_chip, self.trace_chip, self.sweep_chip, self.status_chip, self.clock_chip]:
             chip.label.setFont(ui_font)
@@ -1919,12 +3416,25 @@ class TerminalRoguePySideWindow(QMainWindow):
             QFrame#settingsPane {{
                 background: transparent;
             }}
+            QFrame#saveSlotsPane {{
+                background: transparent;
+            }}
             QLabel#settingsTitle {{
                 color: {PALETTE["white"]};
                 font-weight: 700;
             }}
             QLabel#settingsNote {{
                 color: {PALETTE["muted"]};
+            }}
+            QLabel#saveSlotsTitle {{
+                color: {PALETTE["white"]};
+                font-weight: 700;
+            }}
+            QLabel#saveSlotsNote {{
+                color: {PALETTE["muted"]};
+            }}
+            QLabel#saveSlotsStatus {{
+                color: {PALETTE["cyan"]};
             }}
             QComboBox#settingsCombo, QSpinBox#settingsSpin {{
                 border: 1px solid {PALETTE["panel_border"]};
@@ -1935,6 +3445,17 @@ class TerminalRoguePySideWindow(QMainWindow):
                 min-height: 30px;
             }}
             QComboBox#settingsCombo:hover, QSpinBox#settingsSpin:hover {{
+                border-color: {PALETTE["panel_border_active"]};
+            }}
+            QLineEdit#saveSlotsInput {{
+                border: 1px solid {PALETTE["panel_border"]};
+                border-radius: 7px;
+                background: {PALETTE["terminal_alt"]};
+                color: {PALETTE["text"]};
+                padding: 6px 8px;
+                min-height: 30px;
+            }}
+            QLineEdit#saveSlotsInput:focus {{
                 border-color: {PALETTE["panel_border_active"]};
             }}
             QPushButton#settingsReset {{
@@ -1948,6 +3469,23 @@ class TerminalRoguePySideWindow(QMainWindow):
                 border-color: {PALETTE["panel_border_active"]};
                 background: {PALETTE["accent_soft"]};
             }}
+            QPushButton#saveSlotButton {{
+                border: 1px solid {PALETTE["panel_border"]};
+                border-radius: 8px;
+                background: {PALETTE["terminal_alt"]};
+                color: {PALETTE["text"]};
+                padding: 9px 10px;
+                text-align: left;
+            }}
+            QPushButton#saveSlotButton:hover {{
+                border-color: {PALETTE["panel_border_active"]};
+                background: {PALETTE["accent_soft"]};
+            }}
+            QPushButton#saveSlotButton:disabled {{
+                color: {PALETTE["muted"]};
+                border-color: {PALETTE["panel_border"]};
+                background: rgba(16, 22, 33, 0.85);
+            }}
             QFrame#floatingWindow {{
                 background: {PALETTE["panel"]};
                 border: 1px solid {PALETTE["panel_border"]};
@@ -1958,6 +3496,10 @@ class TerminalRoguePySideWindow(QMainWindow):
             }}
             QFrame#floatingWindow[guided="true"] {{
                 border: 2px solid {PALETTE["yellow"]};
+            }}
+            QFrame#floatingWindow[disturbed="true"] {{
+                border-color: #8a3942;
+                background: #19131a;
             }}
             QFrame#windowHeader {{
                 background: {PALETTE["header"]};
@@ -1971,6 +3513,10 @@ class TerminalRoguePySideWindow(QMainWindow):
             QFrame#floatingWindow[guided="true"] QFrame#windowHeader {{
                 background: #3b3013;
                 border-bottom: 1px solid {PALETTE["yellow"]};
+            }}
+            QFrame#floatingWindow[disturbed="true"] QFrame#windowHeader {{
+                background: #2a151b;
+                border-bottom: 1px solid #a54b57;
             }}
             QLabel#windowAccentDot {{
                 border-radius: 5px;
@@ -2072,7 +3618,7 @@ class TerminalRoguePySideWindow(QMainWindow):
             self.objective,
             self.objective.body,
             self.route,
-            self.route.body,
+            self.route.canvas,
             self.databank,
             self.databank.body,
             self.dev_shell,
@@ -2122,10 +3668,127 @@ class TerminalRoguePySideWindow(QMainWindow):
         self.backend.current_input = command
         self.backend.submit_current_input()
 
+    @staticmethod
+    def filter_completion_matches(candidates, prefix: str):
+        lowered_prefix = (prefix or "").lower()
+        seen = set()
+        matches = []
+        for candidate in candidates:
+            if not candidate:
+                continue
+            if candidate in seen:
+                continue
+            if lowered_prefix and not str(candidate).lower().startswith(lowered_prefix):
+                continue
+            seen.add(candidate)
+            matches.append(candidate)
+        exact = lowered_prefix
+        return sorted(matches, key=lambda value: (str(value).lower() != exact, str(value).lower()))
+
+    @staticmethod
+    def split_completion_input(text: str):
+        raw = text or ""
+        parts = raw.split()
+        if raw.endswith(" "):
+            parts.append("")
+        return parts
+
+    def get_live_terminal_completions(self, text: str):
+        return self.backend.get_terminal_completion_matches(text)
+
+    def get_dev_terminal_completions(self, text: str):
+        parts = self.split_completion_input(text)
+        token = parts[-1] if parts else ""
+
+        installed_scripts = sorted((self.backend.arsenal.scripts if self.backend.arsenal else {}).keys())
+        installed_flags = sorted((self.backend.arsenal.flags if self.backend.arsenal else {}).keys())
+        all_items = sorted((self.backend.item_library or {}).keys())
+        route_ips = self.backend.get_route_completion_node_ids()
+        window_names = sorted({"terminal", "log", "player", "target", "objective", "route", "databank", "dev", "settings", "saves", "payload", "tutorial"})
+
+        if len(parts) <= 1:
+            roots = [
+                "help",
+                "status",
+                "save",
+                "dump",
+                "set",
+                "hp",
+                "grant",
+                "revoke",
+                "give",
+                "take",
+                "reveal",
+                "conceal",
+                "route",
+                "window",
+                "layout",
+                "clear",
+                "cls",
+                "close",
+                "exit",
+                "quit",
+            ]
+            return self.filter_completion_matches(roots, token)
+
+        name = parts[0].lower()
+        if name == "dump":
+            return self.filter_completion_matches(
+                ["player", "target", "objective", "route", "world", "databank", "log", "state", "contracts", "history"],
+                token,
+            )
+        if name == "set":
+            return self.filter_completion_matches(["day", "crypto", "trace", "ram", "maxram"], token)
+        if name == "hp":
+            if len(parts) == 2:
+                return self.filter_completion_matches(["player", "target"], token)
+            if len(parts) == 3:
+                return self.filter_completion_matches(self.backend.get_completion_subsystem_tokens(), token.upper())
+            return []
+        if name in {"grant", "revoke"}:
+            if len(parts) == 2:
+                return self.filter_completion_matches(["script", "flag"], token)
+            if len(parts) == 3 and parts[1].lower() == "script":
+                return self.filter_completion_matches(installed_scripts, token)
+            if len(parts) == 3 and parts[1].lower() == "flag":
+                return self.filter_completion_matches(installed_flags, token)
+            return []
+        if name in {"give", "take"}:
+            if len(parts) == 2:
+                return self.filter_completion_matches(["item"], token)
+            if len(parts) == 3 and parts[1].lower() == "item":
+                return self.filter_completion_matches(all_items, token)
+            if len(parts) == 4 and parts[1].lower() == "item":
+                return self.filter_completion_matches(["1", "2", "3", "4", "5", "10"], token)
+            return []
+        if name in {"reveal", "conceal"}:
+            if len(parts) == 2:
+                return self.filter_completion_matches(["target"], token)
+            if len(parts) == 3 and parts[1].lower() == "target":
+                return self.filter_completion_matches(["surface", "identity", "weapon", "telemetry", "intent", "weakness", "all"], token)
+            return []
+        if name == "route":
+            if len(parts) == 2:
+                return self.filter_completion_matches(["clear", "reopen", "activate"], token)
+            if len(parts) == 3 and parts[1].lower() in {"clear", "reopen", "activate"}:
+                return self.filter_completion_matches([*route_ips, "active"], token)
+            return []
+        if name == "window":
+            if len(parts) == 2:
+                return self.filter_completion_matches(["list", "open", "close", "focus"], token)
+            if len(parts) == 3 and parts[1].lower() in {"open", "close", "focus"}:
+                return self.filter_completion_matches(window_names, token)
+            return []
+        if name == "layout":
+            return self.filter_completion_matches(["reset"], token)
+        return []
+
     def refresh_from_backend(self):
         bootloader_prompt = self.backend.active_prompt.strip().lower().startswith("select an option:")
         if bootloader_prompt and not self.main_menu_active and not self.main_menu_pending_choice:
             self.show_main_menu()
+        elif bootloader_prompt and self.main_menu_active and not self.main_menu_pending_choice:
+            self.update_main_menu_state()
 
         self.refresh_log()
         self.refresh_top_bar()
@@ -2137,13 +3800,21 @@ class TerminalRoguePySideWindow(QMainWindow):
 
         if self.main_menu_active and self.main_menu_pending_choice:
             if self.main_menu_pending_choice == "1":
-                if self.backend.objective_is_tutorial and self.tutorial_boot_started:
+                if self.backend.objective_is_tutorial:
                     self.hide_main_menu()
+                    self.clear_boot_sequence()
             elif self.backend.state is not None and not self.backend.objective_is_tutorial and not bootloader_prompt:
-                self.hide_main_menu()
+                if not self.is_standard_boot_active():
+                    self.dismiss_main_menu_for_standard_loading()
+                    self.start_standard_boot_sequence()
+                    self.reset_window_layout()
+
+        if self.is_standard_boot_active():
+            self.apply_standard_boot_visibility()
 
         self.refresh_prompt_bar()
         self.refresh_taskbar()
+        self.settle_boot_sequence()
 
         if self.backend.game_thread and not self.backend.game_thread.is_alive() and not self.backend.running:
             self.close()
@@ -2156,6 +3827,12 @@ class TerminalRoguePySideWindow(QMainWindow):
         self.refresh_taskbar()
 
     def refresh_log(self):
+        boot_snapshot = self.get_window_boot_snapshot("terminal")
+        if boot_snapshot is not None:
+            if self.feed.set_history(boot_snapshot):
+                self.feed_highlighter.set_line_tones([tone for _line, tone in boot_snapshot])
+                self._last_log_snapshot = boot_snapshot
+            return
         with self.backend.io_lock:
             snapshot = list(self.backend.log_lines)
 
@@ -2181,6 +3858,23 @@ class TerminalRoguePySideWindow(QMainWindow):
             self.clock_chip.set_kind("accent")
             return
 
+        if self.session_boot_profile == "standard" and self.is_any_window_booting():
+            self.brand_label.setText("terminal rogue")
+            self.session_label.setText("root@bootstrap:/sbin/session-init")
+            self.day_chip.set_value("--")
+            self.day_chip.set_kind("accent")
+            self.wallet_chip.set_value("--")
+            self.wallet_chip.set_kind("accent")
+            self.trace_chip.set_value("--")
+            self.trace_chip.set_kind("accent")
+            self.sweep_chip.set_value("--")
+            self.sweep_chip.set_kind("accent")
+            self.status_chip.set_value("bringing windows online")
+            self.status_chip.set_kind("accent")
+            self.clock_chip.set_value(datetime.now().strftime("%H:%M"))
+            self.clock_chip.set_kind("accent")
+            return
+
         identity = self.backend.get_terminal_identity()
         shell_path = self.backend.get_shell_cwd()
         day = self.backend.state.day if self.backend.state else "--"
@@ -2191,7 +3885,7 @@ class TerminalRoguePySideWindow(QMainWindow):
             if self.backend.route_sweep_max
             else "--"
         )
-        active = self.backend.map_status or "idle shell"
+        active = self.get_runtime_status_override() or self.backend.map_status or "idle shell"
         clock_text = datetime.now().strftime("%H:%M")
 
         self.brand_label.setText("terminal rogue")
@@ -2218,6 +3912,33 @@ class TerminalRoguePySideWindow(QMainWindow):
             return "warning"
         return "accent"
 
+    def get_runtime_disturbance_map(self) -> dict[str, list[tuple[str, str]]]:
+        engine = getattr(self.backend, "combat_engine", None)
+        if not engine:
+            return {}
+        with self.backend.io_lock:
+            return {
+                key: list(value)
+                for key, value in getattr(engine, "ui_window_disturbances", {}).items()
+            }
+
+    def get_runtime_status_override(self) -> str:
+        engine = getattr(self.backend, "combat_engine", None)
+        if not engine:
+            return ""
+        with self.backend.io_lock:
+            return str(getattr(engine, "ui_status_override", "") or "")
+
+    def append_runtime_disturbance(self, key: str, text: str) -> str:
+        disturbances = self.get_runtime_disturbance_map()
+        lines = disturbances.get(key, [])
+        if not lines:
+            return text
+        block = "\n".join(line for line, _tone in lines)
+        if not text.strip():
+            return block
+        return text.rstrip() + "\n\n" + block
+
     def refresh_windows(self):
         self.set_window_title("terminal", self.backend.format_pane_title(self.backend.get_shell_cwd()))
         self.set_window_title("log", self.backend.format_pane_title("~/var/log/session.log"))
@@ -2225,14 +3946,27 @@ class TerminalRoguePySideWindow(QMainWindow):
         self.set_window_title("target", self.backend.format_pane_title("~/proc/target"))
         self.set_window_title("objective", self.backend.format_pane_title("~/proc/objective"))
         self.set_window_title("settings", self.backend.format_pane_title("~/usr/share/settings"))
+        self.set_window_title("saves", self.backend.format_pane_title("~/var/lib/saves"))
         self.set_window_title("dev", self.backend.format_pane_title("~/usr/local/devshell"))
         self.set_window_title("route", self.backend.format_pane_title("~/net/routeweb"))
         self.set_window_title("databank", self.backend.format_pane_title("~/usr/share/databank"))
 
+        disturbance_keys = set(self.get_runtime_disturbance_map())
+        pulse_on = int(monotonic() * 4) % 2 == 0
+        for name, window in self.floating_windows.items():
+            window.set_disturbed(name in disturbance_keys and pulse_on)
+
         self.player.set_text(self.build_player_text())
         self.target.set_text(self.build_target_text())
         self.objective.set_text(self.build_objective_text())
-        self.route.set_text(self.build_route_text())
+        self.route.set_network_state(
+            self.backend.map_world,
+            self.backend.map_cleared,
+            self.backend.map_active,
+            self.backend.map_status,
+            staging=self.is_tutorial_staging_state() or self.get_window_boot_text("route") is not None,
+            staging_text=self.build_route_text(),
+        )
         self.log_archive.set_text(self.build_log_text())
         self.databank.set_text(self.build_databank_text())
         self.sync_tutorial_overlay()
@@ -2244,17 +3978,21 @@ class TerminalRoguePySideWindow(QMainWindow):
 
     def lookup_databank_entry(self, raw_line: str):
         line = raw_line.strip()
-        if not line or line in {"TOOLS", "FLAGS", "ITEMS", "TARGETS"}:
+        if not line or line in {"TOOLS", "FLAGS", "ITEMS", "TARGETS", "MARKET"}:
             return None
         if (
             line.upper().startswith("NAME")
             or line.upper().startswith("FLAG")
             or line.upper().startswith("ITEM")
             or line.upper().startswith("TARGET")
+            or line.upper().startswith("SLOT")
         ):
             return None
 
         token = line.split()[0]
+        shop_entries = getattr(self.backend, "shop_databank_entries", {}) or {}
+        if token in shop_entries:
+            return shop_entries[token]
         if token.upper() in {"OS", "SEC", "NET", "MEM", "STO"}:
             return {"kind": "target", "id": token.upper(), "title": token.upper(), "data": {}}
         arsenal = getattr(self.backend, "arsenal", None)
@@ -2567,6 +4305,7 @@ class TerminalRoguePySideWindow(QMainWindow):
             "log": self.backend.build_shell_session_log_text,
             "state": self.build_dev_state_text,
             "contracts": self.build_dev_contract_text,
+            "domains": self.backend.build_shell_domains_text,
             "history": self.build_dev_history_text,
         }
         builder = mapping.get(topic)
@@ -2576,6 +4315,7 @@ class TerminalRoguePySideWindow(QMainWindow):
         state = self.backend.state
         if not state:
             return "state unavailable"
+        tracked = len(state.get_accepted_contracts())
         lines = [
             "session state",
             "",
@@ -2586,16 +4326,38 @@ class TerminalRoguePySideWindow(QMainWindow):
             f"prologue done   {state.prologue_complete}",
             f"origin          {state.origin_story}",
             f"seed            {state.run_seed}",
-            f"contracts       {len(state.current_contracts)} active / {len(state.contract_history)} archived",
+            f"inbox           {len(state.current_contracts)} waiting",
+            f"contracts       {tracked} tracked / {len(state.contract_history)} archived",
+            f"modules         {sum(state.module_inventory.values())} cached / {len(state.rooted_domains)} rooted",
         ]
+        if state.active_network:
+            lines.extend(
+                [
+                    f"network         {state.active_network.name}",
+                    f"domain          {state.current_domain_id or 'none'}",
+                    f"subnet          {state.current_subnet_id or 'none'}",
+                ]
+            )
         return "\n".join(lines)
 
     def build_dev_contract_text(self) -> str:
         state = self.backend.state
-        if not state or not state.current_contracts:
+        if not state:
+            return "contracts // state unavailable"
+        tracked = state.get_accepted_contracts()
+        inbox = list(state.current_contracts)
+        if not tracked and not inbox:
             return "contracts // none active"
         lines = ["contracts", ""]
-        for contract in state.current_contracts:
+        if tracked:
+            lines.append("[tracking]")
+            for contract in tracked:
+                status = self.backend.get_contract_status(contract)
+                lines.append(f"{status:<9} {contract['target_ip']}  {contract['subject']}")
+            lines.append("")
+        if inbox:
+            lines.append("[inbox]")
+        for contract in inbox:
             status = self.backend.get_contract_status(contract)
             lines.append(f"{status:<9} {contract['target_ip']}  {contract['subject']}")
         return "\n".join(lines)
@@ -2983,6 +4745,73 @@ class TerminalRoguePySideWindow(QMainWindow):
             synopsis += " [" + " ".join(allowed_flags) + "]"
         return synopsis
 
+    @staticmethod
+    def describe_module_effects(data: dict, quantity: int = 1) -> list[str]:
+        effect = str(data.get("effect", "module")).replace("_", " ")
+        amount = data.get("amount")
+        lines = [f"installs {effect} infrastructure"]
+        if amount:
+            lines.append(f"payload amount {amount}")
+        if quantity > 1:
+            lines.append(f"package quantity {quantity}")
+        return lines
+
+    @staticmethod
+    def describe_shop_offer_effects(offer: dict, backend) -> list[str]:
+        stock_kind = offer.get("stock_kind", offer.get("type", "unknown"))
+        arsenal = getattr(backend, "arsenal", None)
+        if stock_kind == "script" and arsenal:
+            script_id = offer.get("script_id")
+            return script_effect_lines(script_id, arsenal.scripts.get(script_id, {}))
+        if stock_kind == "flag" and arsenal:
+            flag_id = offer.get("flag_id")
+            return flag_effect_lines(flag_id, arsenal.flags.get(flag_id, {}))
+        if stock_kind == "consumable":
+            item_ref = offer.get("item_id")
+            item_data = offer.get("consumable_library", {}).get(item_ref, {})
+            return item_effect_lines(item_data)
+        if stock_kind == "module":
+            module_id = offer.get("module_id")
+            module_data = offer.get("module_library", {}).get(module_id, {})
+            return TerminalRoguePySideWindow.describe_module_effects(module_data, offer.get("quantity", 1))
+        if stock_kind == "heal":
+            return [f"restores {offer.get('amount', 0)} core OS"]
+        if stock_kind == "ram":
+            return [f"adds {offer.get('amount', 0)} max RAM permanently", "fully restores live RAM after install"]
+        if stock_kind == "trace":
+            return [f"reduces trace by {offer.get('amount', 0)}"]
+        if stock_kind == "bot":
+            return [
+                f"installs a support bot with {offer.get('ram_reservation', 1)} reserved RAM",
+                f"payload RAM cap {offer.get('script_ram_cap', 2)}",
+                f"fires every {offer.get('cadence', 2)} turns",
+            ]
+        return ["market package"]
+
+    @staticmethod
+    def describe_shop_offer(offer: dict, backend) -> str:
+        stock_kind = offer.get("stock_kind", offer.get("type", "unknown"))
+        arsenal = getattr(backend, "arsenal", None)
+        if stock_kind == "script" and arsenal:
+            return arsenal.scripts.get(offer.get("script_id"), {}).get("description", "Market script package.")
+        if stock_kind == "flag" and arsenal:
+            return arsenal.flags.get(offer.get("flag_id"), {}).get("description", "Market modifier package.")
+        if stock_kind == "consumable":
+            item_data = offer.get("consumable_library", {}).get(offer.get("item_id"), {})
+            return item_data.get("description", "One-use field package.")
+        if stock_kind == "module":
+            module_data = offer.get("module_library", {}).get(offer.get("module_id"), {})
+            return module_data.get("description", "Rooted node infrastructure package.")
+        if stock_kind == "heal":
+            return f"Kernel patch bundle. Restores {offer.get('amount', 0)} Core OS."
+        if stock_kind == "ram":
+            return f"Hardware overclock package. Adds {offer.get('amount', 0)} permanent max RAM."
+        if stock_kind == "trace":
+            return f"Trace scrubber pass. Burns off {offer.get('amount', 0)} trace from your current signature."
+        if stock_kind == "bot":
+            return "Support chassis. Installs a lightweight automation bot into your rig."
+        return "Black market package."
+
     def build_databank_entry_text(self, entry) -> str:
         kind = entry["kind"]
         item_id = entry["id"]
@@ -2997,7 +4826,68 @@ class TerminalRoguePySideWindow(QMainWindow):
 
         lines = [f"{entry['title']} // {kind}", ""]
 
-        if kind == "script":
+        if kind == "shop_offer":
+            stock_kind = data.get("stock_kind", data.get("type", "unknown"))
+            lines.extend(
+                [
+                    "SYNOPSIS",
+                    f" buy {data.get('offer_id', item_id)}",
+                    "",
+                    "PROFILE",
+                    f" market price   {data.get('cost', 0)} crypto",
+                    f" stock class    {stock_kind}",
+                ]
+            )
+            if stock_kind == "script":
+                script_id = data.get("script_id")
+                script_data = self.backend.arsenal.scripts.get(script_id, {}) if self.backend.arsenal else {}
+                allowed_flags = self.backend.arsenal.get_owned_allowed_flags(script_id, self.backend.player) if self.backend.arsenal else []
+                lines.extend(
+                    [
+                        f" script         {script_id}",
+                        f" ram cost       {script_data.get('ram', 0)}",
+                        f" class          {str(script_data.get('type', 'tool')).replace('_', '-')}",
+                        f" targeting      {str(script_data.get('default_target')).upper() if script_data.get('default_target') else ('manual or script-defined' if script_data.get('supports_target', True) else 'fixed-domain only')}",
+                        f" supports       {', '.join(allowed_flags) or 'none'}",
+                    ]
+                )
+            elif stock_kind == "flag":
+                flag_id = data.get("flag_id")
+                flag_data = self.backend.arsenal.flags.get(flag_id, {}) if self.backend.arsenal else {}
+                lines.extend(
+                    [
+                        f" flag           {flag_id}",
+                        f" ram cost       +{flag_data.get('ram', 0)}",
+                        " class          modifier",
+                    ]
+                )
+            elif stock_kind == "consumable":
+                lines.extend(
+                    [
+                        f" package        {data.get('item_id', item_id)} x{data.get('quantity', 1)}",
+                        " class          consumable",
+                    ]
+                )
+            elif stock_kind == "module":
+                lines.extend(
+                    [
+                        f" package        {data.get('module_id', item_id)} x{data.get('quantity', 1)}",
+                        " class          module",
+                    ]
+                )
+            elif stock_kind == "bot":
+                lines.extend(
+                    [
+                        f" reserve        {data.get('ram_reservation', 1)} RAM",
+                        f" payload cap    {data.get('script_ram_cap', 2)} RAM",
+                        f" cadence        {data.get('cadence', 2)} turns",
+                    ]
+                )
+            elif stock_kind in {"heal", "ram", "trace"}:
+                lines.append(f" payload amount {data.get('amount', 0)}")
+            description = self.describe_shop_offer(data, self.backend)
+            effects = self.describe_shop_offer_effects(data, self.backend)
+        elif kind == "script":
             allowed_flags = self.backend.arsenal.get_owned_allowed_flags(item_id, self.backend.player)
             class_name = str(data.get("type", "tool")).replace("_", "-")
             supports_target = data.get("supports_target", True)
@@ -3075,7 +4965,7 @@ class TerminalRoguePySideWindow(QMainWindow):
 
         if kind == "target":
             description = self.backend.get_manual_entry(item_id.lower()) or "No description loaded."
-        else:
+        elif kind != "shop_offer":
             description = data.get("description", "No description loaded.")
         lines.extend(["", "DESCRIPTION", f" {description}"])
         if effects:
@@ -3083,138 +4973,6 @@ class TerminalRoguePySideWindow(QMainWindow):
             for effect in effects:
                 lines.append(f" - {effect}")
         return "\n".join(lines)
-
-    @staticmethod
-    def describe_script_effects(script_id: str, data: dict) -> list[str]:
-        effects = []
-        if data.get("damage"):
-            effects.append(f"It deals {data['damage']} base damage before flags, defenses, and reactions.")
-        if data.get("repair"):
-            effects.append(f"It restores {data['repair']} Core OS integrity.")
-        if data.get("disrupt_turns"):
-            effects.append(f"It peels back SEC for {data['disrupt_turns']} turn(s).")
-        if data.get("guard"):
-            effects.append(f"It creates a {data['guard']}-point ACL shell for {data.get('turns', 1)} turn(s).")
-        if data.get("trap_damage"):
-            effects.append(f"It fires back for {data['trap_damage']} damage when triggered.")
-        if data.get("ratio"):
-            effects.append(f"It reflects hostile pressure at {int(data['ratio'] * 100)}% strength.")
-        if data.get("flat_damage"):
-            effects.append(f"It adds {data['flat_damage']} flat feedback damage.")
-        if script_id == "ping":
-            effects.append("Successful hits leave a short timing mark, making same-lane follow-up payloads land cleaner.")
-        if script_id == "nmap":
-            effects.append("Targeted fingerprinting primes later exploit payloads on that lane.")
-        if script_id == "spray":
-            effects.append("Successful auth pressure primes the lane for stronger Hydra follow-up.")
-        if script_id == "sqlmap":
-            effects.append("Endpoint hits from dirb make later injections hit harder.")
-        if script_id == "shred":
-            effects.append("Damaged MEM and STO lanes can be kept from recovering for a short window.")
-        if script_id == "overflow":
-            effects.append("Successful hits on MEM or NET can jam the host's next action.")
-        if script_id == "hammer":
-            effects.append("Open-core hits can trigger collateral subsystem damage and stall the host's next move.")
-        if script_id == "spoof":
-            effects.append("It also blurs the host's short-term response model, making recent pattern reads less reliable.")
-        if script_id == "harden":
-            effects.append("If it matches the lane the host is already winding up on, the ACL shell comes in stronger.")
-        if script_id == "rekey":
-            effects.append("It also invalidates the host's recent adaptation cache.")
-        if script_id == "patch":
-            effects.append("It can lightly repair the worst supporting lane and warm a little RAM back up.")
-        script_specific = {
-            "ping": "Cheap packet pressure for cleanup work. It can also expose hostile timing and mark a lane for cleaner follow-up.",
-            "nmap": "Broad port and banner scan. Targeted mode behaves like deeper fingerprinting once SEC is open and sets up exploit work there.",
-            "enum": "Pulls exact telemetry and resolves live hostile intent on one subsystem.",
-            "whois": "Owner and allocation lookup that also discounts the next recon action.",
-            "dirb": "Endpoint discovery for one lane. It also primes later injection work on that lane.",
-            "airmon-ng": "Monitor-mode pivot used here to peel back perimeter controls on SEC.",
-            "hydra": "Rapid credential brute force. It improves on auth lanes and gets stronger after spray pressure.",
-            "sqlmap": "Database and web injection pressure. It gets stronger once dirb already found exposed paths.",
-            "spray": "Password spray pressure that can wobble perimeter or broker services and prime later hydra bursts.",
-            "shred": "Destructive wipe routine that spikes once a lane is unstable and slows repair afterward.",
-            "overflow": "Memory corruption payload for MEM- and NET-heavy runtime services; successful hits can jam the next hostile action.",
-            "hammer": "Homebrew crash harness for already-open cores that can force a panic spill.",
-            "spoof": "Rolls hostile recon back and muddies the host's short-term traffic model.",
-            "honeypot": "Poisons the next hostile scan with decoy telemetry.",
-            "canary": "Arm it where you think the next hostile action will land.",
-            "sinkhole": "Reflect the next committed hostile action on one lane.",
-            "rekey": "Session hygiene under fire: clears RAM locks, strips back recon, and resets hostile cacheing.",
-            "patch": "Small repair cycle without spending an item, with a bit of supporting stabilization.",
-        }
-        if script_id in script_specific:
-            effects.append(script_specific[script_id])
-        if not effects:
-            effects.append("No extra combat riders beyond its main effect.")
-        return effects
-
-    @staticmethod
-    def describe_flag_effects(flag_id: str, data: dict) -> list[str]:
-        effects = []
-        if data.get("damage_bonus"):
-            effects.append(f"It adds +{data['damage_bonus']} damage.")
-        if data.get("noise_bonus"):
-            effects.append(f"It adds +{data['noise_bonus']} trace noise.")
-        if data.get("exposure_delta"):
-            effects.append(f"It changes recon exposure by {data['exposure_delta']}.")
-        flag_specific = {
-            "--ransom": "Wraps the payload in monetization logic. You only get paid if damage actually lands.",
-            "--stealth": "Higher-cost low-observable wrapper.",
-            "--ghost": "Cheaper OPSEC wrapper for recon-heavy turns.",
-            "--worm": "Residual damage propagates if the first lane collapses.",
-            "--burst": "Aggressive timing wrapper: more damage, more noise.",
-            "--volatile": "Unsafe overclock: harder hit, louder trace.",
-            "--fork": "Multi-thread wrapper that spills part of the hit into a second lane.",
-        }
-        if flag_id in flag_specific:
-            effects.append(flag_specific[flag_id])
-        if not effects:
-            effects.append("Modifier details loaded from the current arsenal.")
-        return effects
-
-    @staticmethod
-    def describe_item_effects(data: dict) -> list[str]:
-        effects = []
-        if data.get("amount"):
-            effects.append(f"Value: {data['amount']}.")
-        if data.get("turns"):
-            effects.append(f"Duration: {data['turns']} turn(s).")
-        if data.get("trap_damage"):
-            effects.append(f"Trap payload: {data['trap_damage']} damage.")
-        if data.get("jammer_turns"):
-            effects.append(f"Decoy window: {data['jammer_turns']} turn(s).")
-        if data.get("scrub_stages"):
-            effects.append(f"Scrubs {data['scrub_stages']} hostile recon stage(s).")
-        if not effects:
-            effects.append("Single-use tactical utility.")
-        return effects
-
-    @staticmethod
-    def describe_target_effects(target_id: str) -> list[str]:
-        return {
-            "OS": [
-                "Core execution plane. If it crashes, the fight ends.",
-                "Subsystem failures can also propagate secondary pressure into OS.",
-            ],
-            "SEC": [
-                "Perimeter and access-control layer. It catches most direct OS pressure.",
-                "Breaking it improves later fingerprinting and direct core damage.",
-            ],
-            "NET": [
-                "Routing and scan plane.",
-                "Damaging it degrades recon quality, trace routines, and clean disconnects.",
-            ],
-            "MEM": [
-                "Runtime state and allocator pool.",
-                "As MEM gets damaged, RAM recovers more slowly every turn.",
-                "Every 4 missing MEM HP also cuts 1 effective max RAM.",
-            ],
-            "STO": [
-                "Storage, archives, and cached value.",
-                "Breaking it can spill extra loot without ending the fight.",
-            ],
-        }.get(target_id, ["Subsystem reference entry."])
 
     @staticmethod
     def describe_script_effects(script_id: str, data: dict) -> list[str]:
@@ -3233,9 +4991,10 @@ class TerminalRoguePySideWindow(QMainWindow):
         return target_effect_lines(target_id)
 
     def refresh_prompt_bar(self):
-        tutorial_gate_locked = self.is_tutorial_boot_active() or self.is_tutorial_warmup_gate_active()
+        boot_locked = self.get_window_boot_stage("terminal") is not None
+        tutorial_gate_locked = self.is_tutorial_boot_active() or self.is_tutorial_warmup_gate_active() or boot_locked
         prompt = ""
-        if not self.is_tutorial_warmup_gate_active():
+        if not self.is_tutorial_warmup_gate_active() and not boot_locked:
             prompt = self.backend.active_prompt if self.backend.active_prompt else ""
         active = bool(prompt.strip())
         self.feed.input_locked = tutorial_gate_locked
@@ -3270,6 +5029,9 @@ class TerminalRoguePySideWindow(QMainWindow):
         return self.backend.objective_is_tutorial and not self.backend.current_enemy
 
     def build_objective_text(self) -> str:
+        boot_text = self.get_window_boot_text("objective")
+        if boot_text is not None:
+            return boot_text
         if self.backend.objective_is_tutorial:
             return objective_staging_text(active=not self.is_tutorial_staging_state())
 
@@ -3283,43 +5045,79 @@ class TerminalRoguePySideWindow(QMainWindow):
             lines.append(f"TRY: {self.backend.objective_command}")
         if self.backend.objective_detail:
             lines.append(f"WHY: {self.backend.objective_detail}")
+        if self.backend.state:
+            active_contract_lines = self.backend.state.get_active_contract_summary_lines(limit=4)
+            if active_contract_lines:
+                lines.extend(["", *active_contract_lines])
         return "\n".join(lines)
 
     def build_player_text(self) -> str:
+        boot_text = self.get_window_boot_text("player")
+        if boot_text is not None:
+            return boot_text
         if self.is_tutorial_staging_state():
             return player_staging_text()
-        player = self.backend.player
-        state = self.backend.state
+        with self.backend.io_lock:
+            player = self.backend.player
+            state = self.backend.state
+            projection = None
+            if getattr(self.backend, "combat_engine", None):
+                snapshot = getattr(self.backend.combat_engine, "planning_snapshot", None)
+                if snapshot:
+                    projection = snapshot.get("projection")
         if not player or not state:
             return "bootstrapping session state..."
 
         ram_max = player.get_effective_max_ram()
         ram_regen = player.get_ram_regen()
-        lines = [
-            f"{player.handle} // {player.title}",
-            f"ip {player.local_ip}",
-            f"ram {player.current_ram}/{ram_max}  regen {ram_regen}/turn (mem)",
-            f"signature {player.signature_subsystem}",
-            "",
-        ]
-
-        for left, right in [("OS", "SEC"), ("NET", "MEM")]:
-            left_sub = player.subsystems[left]
-            right_sub = player.subsystems[right]
-            lines.append(
-                f"{left:<3} {left_sub.current_hp:>2}/{left_sub.max_hp:<2}   "
-                f"{right:<3} {right_sub.current_hp:>2}/{right_sub.max_hp:<2}"
-            )
-
+        stack_detail_line = None
+        stack_outcome_line = None
+        if projection and projection.projected_player and projection.steps:
+            ghost_player = projection.projected_player
+            legality = "legal" if projection.legal else "fault"
+            ram_delta = ghost_player.current_ram - player.current_ram
+            delta_text = f"{ram_delta:+d}"
+            detail_bits = [f"{delta_text} RAM", legality.upper()]
+            stack_detail_line = "STACK DELTA  " + "   ".join(detail_bits)
+            if projection.root_prediction:
+                stack_outcome_line = f"STACK OUTCOME  {projection.root_prediction.upper()}"
+        defense_text = player.get_defense_summary().replace("DEFENSE     ", "").lower()
+        cache_text = player.get_hardening_summary().lower() if player.adaptive_hardening_active else ""
+        bot_text = player.get_support_bot_summary().replace("BOT BAY     ", "").lower()
+        item_text = player.get_consumable_summary().lower()
         sto = player.subsystems["STO"]
-        lines.append(f"STO {sto.current_hp:>2}/{sto.max_hp:<2}")
-        lines.append("")
-        lines.append(player.get_defense_summary())
-        lines.append(player.get_support_bot_summary())
-        lines.append(f"items {player.get_consumable_summary()}")
-        return "\n".join(lines)
+        lines = [
+            f"RAM {player.current_ram}/{ram_max}   REGEN {ram_regen}/turn",
+        ]
+        if stack_detail_line:
+            lines.append(stack_detail_line)
+        if stack_outcome_line:
+            lines.append(stack_outcome_line)
+        lines.extend(
+            [
+                f"{player.handle} // {player.title}",
+                f"SIGNATURE  {player.signature_subsystem}   IP {player.local_ip}",
+                (
+                    f"OS {player.subsystems['OS'].current_hp:>2}/{player.subsystems['OS'].max_hp:<2}   "
+                    f"SEC {player.subsystems['SEC'].current_hp:>2}/{player.subsystems['SEC'].max_hp:<2}"
+                ),
+                (
+                    f"NET {player.subsystems['NET'].current_hp:>2}/{player.subsystems['NET'].max_hp:<2}   "
+                    f"MEM {player.subsystems['MEM'].current_hp:>2}/{player.subsystems['MEM'].max_hp:<2}   "
+                    f"STO {sto.current_hp:>2}/{sto.max_hp:<2}"
+                ),
+                f"def {defense_text}",
+                f"CACHE {cache_text or ('priming' if player.adaptive_hardening_active else 'offline')}",
+                f"bots {bot_text}",
+                f"items {item_text}",
+            ]
+        )
+        return self.append_runtime_disturbance("player", "\n".join(lines))
 
     def build_target_text(self) -> str:
+        boot_text = self.get_window_boot_text("target")
+        if boot_text is not None:
+            return boot_text
         enemy = self.backend.current_enemy
         if not enemy:
             if self.is_tutorial_staging_state():
@@ -3369,7 +5167,13 @@ class TerminalRoguePySideWindow(QMainWindow):
         lines.append("SUBSYSTEMS")
         for key in ("OS", "SEC", "NET", "MEM", "STO"):
             lines.append(self.enemy_subsystem_detail_row(enemy, key))
-        return "\n".join(lines)
+        lines.append("")
+        lines.append("BUSES")
+        lines.extend(enemy.get_bus_report_lines())
+        held_summary = enemy.get_hold_buffer_summary()
+        if held_summary != "none":
+            lines.extend(["", f"STAGED      {held_summary}"])
+        return self.append_runtime_disturbance("target", "\n".join(lines))
 
     @staticmethod
     def enemy_subsystem_row(enemy, left: str, right: str | None = None) -> str:
@@ -3401,14 +5205,20 @@ class TerminalRoguePySideWindow(QMainWindow):
         return f" {key:<3} {subsystem.name:<10} {status:<7} {pressure}"
 
     def build_route_text(self) -> str:
+        boot_text = self.get_window_boot_text("route")
+        if boot_text is not None:
+            return boot_text
         if self.is_tutorial_staging_state():
             return route_staging_text()
-        return self.build_route_map_text()
+        return self.append_runtime_disturbance("route", self.build_route_map_text())
 
     def build_log_text(self) -> str:
+        boot_text = self.get_window_boot_text("log")
+        if boot_text is not None:
+            return boot_text
         if self.is_tutorial_staging_state():
             return log_staging_text()
-        return self.backend.build_shell_session_log_text()
+        return self.append_runtime_disturbance("log", self.backend.build_shell_session_log_text())
 
     def build_route_map_text(self) -> str:
         world = self.backend.map_world
@@ -3423,63 +5233,67 @@ class TerminalRoguePySideWindow(QMainWindow):
         if focus_index is None:
             focus_index = min(world.entry_links) if world.entry_links else 0
         focus_node = world.nodes[focus_index]
+        focus_depth = world.node_depths.get(focus_index, 1)
 
         lines = [
             world.subnet_name,
             self.backend.map_status or "mesh idle",
             "",
-            "[active node]",
+            "[focus]",
             f" {self.describe_route_node(world, focus_index, focus_node)}",
+            f" depth {focus_depth}",
         ]
 
         active_intel = self.backend.build_node_intel_summary(focus_node)
         if active_intel:
             lines.append(f"  {active_intel}")
 
-        neighbor_indices = sorted(
-            world.links.get(focus_index, set()),
+        ingress_indices = world.get_inbound_hops(focus_index)
+        lines.extend(["", "[ingress]"])
+        if focus_index in world.entry_links:
+            lines.append(" <- shell uplink // public route hop")
+        if not ingress_indices:
+            if focus_index not in world.entry_links:
+                lines.append(" none")
+        else:
+            for node_index in ingress_indices:
+                node = world.nodes[node_index]
+                lines.append(f" <- {self.describe_route_node(world, node_index, node)}")
+
+        outbound_indices = sorted(
+            world.get_outbound_hops(focus_index),
             key=lambda idx: (world.node_depths.get(idx, 99), world.nodes[idx].ip_address),
         )
-        if not neighbor_indices:
-            lines.extend(["", "linked hops", " none"])
+        lines.extend(["", "[egress]"])
+        if not outbound_indices:
+            lines.append(" none")
         else:
-            lines.extend(["", "linked hops"])
-            for position, node_index in enumerate(neighbor_indices):
+            for node_index in outbound_indices:
                 node = world.nodes[node_index]
-                branch = "`-" if position == len(neighbor_indices) - 1 else "|-"
-                lines.append(f" {branch} {self.describe_route_node(world, node_index, node)}")
+                lines.append(f" -> {self.describe_route_node(world, node_index, node)}")
                 intel = self.route_node_secondary_line(world, focus_index, node_index, node)
                 if intel:
-                    spacer = "   " if position == len(neighbor_indices) - 1 else "|  "
-                    lines.append(f" {spacer}{intel}")
+                    lines.append(f"    {intel}")
 
-                next_hops = sorted(
-                    linked for linked in world.links.get(node_index, set()) if linked != focus_index
-                )
+                next_hops = world.get_outbound_hops(node_index)
                 if next_hops:
                     preview = ", ".join(self.route_node_short_label(world, linked) for linked in next_hops[:3])
-                    spacer = "   " if position == len(neighbor_indices) - 1 else "|  "
-                    lines.append(f" {spacer}next: {preview}")
+                    lines.append(f"    fanout: {preview}")
 
-        lines.extend(["", "mail = dead-drop inbox", "bot = bot bay"])
         return "\n".join(lines)
 
     def describe_route_node(self, world, node_index: int, node) -> str:
         status = self.backend.get_node_status_text(node_index, node, self.backend.map_cleared)
         label = self.route_node_label(world, node_index, node)
+        depth = world.node_depths.get(node_index, 1)
         if label == node.ip_address:
-            return f"{label} [{status}]"
-        return f"{label} @ {node.ip_address} [{status}]"
+            return f"{label} [{status}] d{depth}"
+        return f"{label} @ {node.ip_address} [{status}] d{depth}"
 
     def route_node_secondary_line(self, world, focus_index: int, node_index: int, node) -> str | None:
         status = self.backend.get_node_status_text(node_index, node, self.backend.map_cleared)
         if status == "LOCKED":
-            unlock_source_indexes = world.get_unlock_sources(node_index)
-            if focus_index in unlock_source_indexes:
-                return "clear active node to open route"
-            unlock_sources = [world.nodes[source_index].ip_address for source_index in unlock_source_indexes]
-            if unlock_sources:
-                return "route via " + " / ".join(unlock_sources[:2])
+            return "route sealed"
         return self.backend.build_node_intel_summary(node)
 
     def route_node_label(self, world, node_index: int, node) -> str:
@@ -3541,8 +5355,13 @@ class TerminalRoguePySideWindow(QMainWindow):
         return "\n".join(lines)
 
     def build_databank_text(self) -> str:
+        boot_text = self.get_window_boot_text("databank")
+        if boot_text is not None:
+            return boot_text
         if self.is_tutorial_staging_state():
             return databank_staging_text()
+        if getattr(self.backend, "shop_databank_entries", None):
+            return self.backend.build_shell_databank_text()
         arsenal = getattr(self.backend, "arsenal", None)
         if not arsenal:
             return "\n".join(self.backend.databank_lines)
@@ -3660,6 +5479,8 @@ class TerminalRoguePySideWindow(QMainWindow):
             self.tutorial_boot_revealed = set()
             self.tutorial_warmup_requested = False
             self.tutorial_warmup_gate_pending = False
+            self.tutorial_warmup_release_sent = False
+            self.clear_tutorial_live_boot_sequence()
             self.feed.input_locked = False
             if window.isVisible():
                 window.hide()
@@ -3668,8 +5489,18 @@ class TerminalRoguePySideWindow(QMainWindow):
         if not self.tutorial_boot_started:
             self.start_tutorial_boot_sequence()
 
+        if (
+            self.is_tutorial_warmup_gate_active()
+            and self.tutorial_warmup_requested
+            and not self.tutorial_warmup_release_sent
+            and bool(self.backend.active_prompt)
+        ):
+            self.tutorial_warmup_release_sent = True
+            self.backend.input_queue.put("")
+
         if self.tutorial_warmup_gate_pending and self.backend.current_enemy:
             self.tutorial_warmup_gate_pending = False
+            self.start_tutorial_live_boot_sequence()
 
         text, focused = self.build_tutorial_overlay()
         if not text:
