@@ -1,6 +1,5 @@
 # Terminal Rogue
 
-Terminal Rogue is a Python cyber-ops roguelike with a custom PySide6 desktop UI, turn-based encounters, evolving node maps, contracts, and a staged tutorial flow.
 
 ## Run From Source
 
